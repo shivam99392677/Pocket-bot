@@ -26,7 +26,8 @@ function createAuthMiddleware(db) {
         try {
             const parts = token.split('.');
             if (parts.length === 3) {
-                const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+                const payloadStr = Buffer.from(parts[1], 'base64url').toString('utf8');
+                const payload = JSON.parse(payloadStr);
 
                 if (payload.email) {
                     // Look up user in our PostgreSQL DB
