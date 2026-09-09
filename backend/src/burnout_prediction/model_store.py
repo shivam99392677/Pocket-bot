@@ -15,10 +15,13 @@ log = logging.getLogger(__name__)
 def resolve_model_dir() -> str:
     """
     Finds or creates the models/ directory relative to this file.
-    Works regardless of where the process is started from.
+    Uses /tmp/models when running in Vercel serverless environment.
     """
-    here = Path(__file__).resolve().parent
-    model_dir = here / "models"
+    if os.getenv("VERCEL"):
+        model_dir = Path("/tmp/models")
+    else:
+        here = Path(__file__).resolve().parent
+        model_dir = here / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
     return str(model_dir)
 
