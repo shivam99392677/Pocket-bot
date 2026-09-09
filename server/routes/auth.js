@@ -1,6 +1,6 @@
 // ============================================================
-// AUTH ROUTES - MVP Mode (no service account key)
-// Firebase handles auth client-side. This syncs users to our DB.
+// AUTH ROUTES - PostgreSQL Edition
+// Syncs Firebase & local user credentials with PostgreSQL
 // ============================================================
 const express = require('express');
 const bcrypt = require('bcryptjs');
@@ -18,8 +18,8 @@ module.exports = function (db, authenticateToken) {
                 return res.status(400).json({ error: 'Email, password, and name are required.' });
             }
 
-            const existingUser = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-            if (existingUser) {
+            const existingUserRes = await db.query('SELECT id FROM users WHERE email = $1', [email]);
+            if (existingUserRes.rows.length > 0) {
                 return res.status(400).json({ error: 'Email already registered.' });
             }
 
@@ -27,13 +27,16 @@ module.exports = function (db, authenticateToken) {
             const income = monthly_income || 0;
             const dailyBudget = income > 0 ? Math.round((income / 30) * 100) / 100 : 0;
 
-            const result = db.prepare(`
-        INSERT INTO users (email, password, name, major, year, monthly_income, daily_budget)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(email, hashedPassword, name, major || '', year || 1, income, dailyBudget);
+            const insertRes = await db.query(`
+                INSERT INTO users (email, password, name, major, year, monthly_income, daily_budget)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id
+            `, [email, hashedPassword, name, major || '', year || 1, income, dailyBudget]);
+
+            const userId = insertRes.rows[0].id;
 
             const token = jwt.sign(
-                { id: result.lastInsertRowid, email, name },
+                { id: userId, email, name },
                 process.env.JWT_SECRET,
                 { expiresIn: '7d' }
             );
@@ -41,7 +44,7 @@ module.exports = function (db, authenticateToken) {
             res.status(201).json({
                 message: 'Account created!',
                 token,
-                user: { id: result.lastInsertRowid, email, name, major, year }
+                user: { id: userId, email, name, major, year }
             });
         } catch (err) {
             console.error('Register error:', err);
@@ -58,7 +61,9 @@ module.exports = function (db, authenticateToken) {
                 return res.status(400).json({ error: 'Email and password are required.' });
             }
 
-            const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+            const userRes = await db.query('SELECT * FROM users WHERE email = $1', [email]);
+            const user = userRes.rows[0];
+
             if (!user) {
                 return res.status(401).json({ error: 'Invalid email or password.' });
             }
@@ -81,7 +86,15 @@ module.exports = function (db, authenticateToken) {
             res.json({
                 message: 'Login successful!',
                 token,
-                user: { id: user.id, email: user.email, name: user.name, major: user.major, year: user.year, monthly_income: user.monthly_income, daily_budget: user.daily_budget }
+                user: {
+                    id: user.id,
+                    email: user.email,
+                    name: user.name,
+                    major: user.major,
+                    year: user.year,
+                    monthly_income: user.monthly_income,
+                    daily_budget: user.daily_budget
+                }
             });
         } catch (err) {
             console.error('Login error:', err);
@@ -90,8 +103,7 @@ module.exports = function (db, authenticateToken) {
     });
 
     // POST /api/auth/firebase-sync - Create/find user after Firebase login
-    // No service account needed — trusts client-side Firebase auth
-    router.post('/firebase-sync', (req, res) => {
+    router.post('/firebase-sync', async (req, res) => {
         try {
             const { name, email, uid, major, student_type, year, monthly_income } = req.body;
 
@@ -99,7 +111,8 @@ module.exports = function (db, authenticateToken) {
                 return res.status(400).json({ error: 'Email is required.' });
             }
 
-            let user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+            const userRes = await db.query('SELECT * FROM users WHERE email = $1', [email]);
+            let user = userRes.rows[0];
 
             if (!user) {
                 // Create new user from Firebase
@@ -107,21 +120,40 @@ module.exports = function (db, authenticateToken) {
                 const income = monthly_income || 0;
                 const dailyBudget = income > 0 ? Math.round((income / 30) * 100) / 100 : 0;
 
-                const result = db.prepare(`
-          INSERT INTO users (email, password, name, major, student_type, year, monthly_income, daily_budget)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(email, `firebase:${uid || 'user'}`, displayName, major || '', student_type || '', year || 1, income, dailyBudget);
+                const insertRes = await db.query(`
+                    INSERT INTO users (email, password, name, major, student_type, year, monthly_income, daily_budget)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    RETURNING id
+                `, [email, `firebase:${uid || 'user'}`, displayName, major || '', student_type || '', year || 1, income, dailyBudget]);
 
-                user = { id: result.lastInsertRowid, email, name: displayName, major: major || '', student_type: student_type || '', year: year || 1, monthly_income: income, daily_budget: dailyBudget };
+                user = {
+                    id: insertRes.rows[0].id,
+                    email,
+                    name: displayName,
+                    major: major || '',
+                    student_type: student_type || '',
+                    year: year || 1,
+                    monthly_income: income,
+                    daily_budget: dailyBudget
+                };
             } else if (name && name !== user.name) {
                 // Update name if changed
-                db.prepare('UPDATE users SET name = ? WHERE id = ?').run(name, user.id);
+                await db.query('UPDATE users SET name = $1 WHERE id = $2', [name, user.id]);
                 user.name = name;
             }
 
             res.json({
                 message: 'User synced!',
-                user: { id: user.id, email: user.email, name: user.name, major: user.major, student_type: user.student_type, year: user.year, monthly_income: user.monthly_income, daily_budget: user.daily_budget }
+                user: {
+                    id: user.id,
+                    email: user.email,
+                    name: user.name,
+                    major: user.major,
+                    student_type: user.student_type,
+                    year: user.year,
+                    monthly_income: user.monthly_income,
+                    daily_budget: user.daily_budget
+                }
             });
         } catch (err) {
             console.error('Firebase sync error:', err);
@@ -130,29 +162,46 @@ module.exports = function (db, authenticateToken) {
     });
 
     // GET /api/auth/profile
-    router.get('/profile', authenticateToken, (req, res) => {
-        const user = db.prepare(`
-      SELECT id, email, name, major, student_type, year, monthly_income, daily_budget, dietary_preferences, emergency_contact, created_at
-      FROM users WHERE id = ?
-    `).get(req.user.id);
+    router.get('/profile', authenticateToken, async (req, res) => {
+        try {
+            const userRes = await db.query(`
+                SELECT id, email, name, major, student_type, year, monthly_income, daily_budget, dietary_preferences, emergency_contact, created_at
+                FROM users WHERE id = $1
+            `, [req.user.id]);
 
-        if (!user) return res.status(404).json({ error: 'User not found.' });
-        res.json(user);
+            const user = userRes.rows[0];
+
+            if (!user) return res.status(404).json({ error: 'User not found.' });
+            res.json(user);
+        } catch (err) {
+            console.error('Get profile error:', err);
+            res.status(500).json({ error: 'Failed to fetch profile.' });
+        }
     });
 
     // PUT /api/auth/profile
-    router.put('/profile', authenticateToken, (req, res) => {
-        const { name, major, student_type, year, monthly_income, daily_budget, dietary_preferences, emergency_contact } = req.body;
+    router.put('/profile', authenticateToken, async (req, res) => {
+        try {
+            const { name, major, student_type, year, monthly_income, daily_budget, dietary_preferences, emergency_contact } = req.body;
 
-        db.prepare(`
-      UPDATE users SET
-        name = COALESCE(?, name), major = COALESCE(?, major), student_type = COALESCE(?, student_type), year = COALESCE(?, year),
-        monthly_income = COALESCE(?, monthly_income), daily_budget = COALESCE(?, daily_budget),
-        dietary_preferences = COALESCE(?, dietary_preferences), emergency_contact = COALESCE(?, emergency_contact)
-      WHERE id = ?
-    `).run(name, major, student_type, year, monthly_income, daily_budget, dietary_preferences, emergency_contact, req.user.id);
+            await db.query(`
+                UPDATE users SET
+                    name = COALESCE($1, name),
+                    major = COALESCE($2, major),
+                    student_type = COALESCE($3, student_type),
+                    year = COALESCE($4, year),
+                    monthly_income = COALESCE($5, monthly_income),
+                    daily_budget = COALESCE($6, daily_budget),
+                    dietary_preferences = COALESCE($7, dietary_preferences),
+                    emergency_contact = COALESCE($8, emergency_contact)
+                WHERE id = $9
+            `, [name, major, student_type, year, monthly_income, daily_budget, dietary_preferences, emergency_contact, req.user.id]);
 
-        res.json({ message: 'Profile updated.' });
+            res.json({ message: 'Profile updated.' });
+        } catch (err) {
+            console.error('Update profile error:', err);
+            res.status(500).json({ error: 'Failed to update profile.' });
+        }
     });
 
     return router;

@@ -1,8 +1,6 @@
 // ============================================================
-// AUTH MIDDLEWARE - MVP Mode
-// Firebase auth is handled client-side. Server decodes the
-// Firebase JWT token to get user email (no signature verify).
-// Also supports fallback JWT tokens we issue ourselves.
+// AUTH MIDDLEWARE - PostgreSQL Edition
+// Decodes JWT token and verifies user against PostgreSQL database.
 // ============================================================
 const jwt = require('jsonwebtoken');
 
@@ -31,8 +29,9 @@ function createAuthMiddleware(db) {
                 const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
 
                 if (payload.email) {
-                    // Look up user in our DB
-                    const dbUser = db.prepare('SELECT id, email, name FROM users WHERE email = ?').get(payload.email);
+                    // Look up user in our PostgreSQL DB
+                    const result = await db.query('SELECT id, email, name FROM users WHERE email = $1', [payload.email]);
+                    const dbUser = result.rows[0];
 
                     if (dbUser) {
                         req.user = { id: dbUser.id, email: dbUser.email, name: dbUser.name };

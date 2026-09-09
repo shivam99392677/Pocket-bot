@@ -1,17 +1,15 @@
-import sqlite3
 from datetime import datetime
 from typing import Dict, List, Any
 import calendar
 
 from burnout_prediction.feature_engineer import FeatureEngineer
 from burnout_prediction.burnout_predictor import BurnoutPredictor
-from expense_management.sqlite_service import DB_PATH, SQLiteExpenseService
+from expense_management.sqlite_service import SQLiteExpenseService
 
 class WellnessEngine:
     def __init__(self):
-        self.db_path = DB_PATH
-        self.fe = FeatureEngineer(self.db_path)
-        self.predictor = BurnoutPredictor(self.db_path)
+        self.fe = FeatureEngineer()
+        self.predictor = BurnoutPredictor()
         self.db_service = SQLiteExpenseService()
 
     def calculate_financial_health(self, user_id: str) -> Dict[str, Any]:

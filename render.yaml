@@ -1,0 +1,72 @@
+# ============================================================
+# Render Blueprint Specification for PocketBuddy Monorepo
+# Includes PostgreSQL, Express API, FastAPI ML Service & React Client
+# ============================================================
+
+services:
+  # ------------------------------------------------------------
+  # 1. FastAPI Web Service (Python Backend / ML Engines)
+  # ------------------------------------------------------------
+  - type: web
+    name: pocketbuddy-fastapi
+    env: python
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.src.main_api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: pocketbuddy-db
+          property: connectionString
+      - key: PYTHONPATH
+        value: backend/src
+      - key: GROQ_API_KEY
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+
+  # ------------------------------------------------------------
+  # 2. Express Web Service (Node.js Auth, Expenses, Router)
+  # ------------------------------------------------------------
+  - type: web
+    name: pocketbuddy-express
+    env: node
+    buildCommand: npm install
+    startCommand: node server/index.js
+    healthCheckPath: /api/health-check
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: pocketbuddy-db
+          property: connectionString
+      - key: PYTHON_BACKEND_URL
+        value: http://pocketbuddy-fastapi:8000
+      - key: JWT_SECRET
+        sync: false
+      - key: NODE_ENV
+        value: production
+
+  # ------------------------------------------------------------
+  # 3. React Client (Static Web Site)
+  # ------------------------------------------------------------
+  - type: web
+    name: pocketbuddy-client
+    env: static
+    buildCommand: cd client && npm install && npm run build
+    staticPublishPath: client/build
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: REACT_APP_API_URL
+        sync: false
+
+databases:
+  # ------------------------------------------------------------
+  # Managed PostgreSQL Database
+  # ------------------------------------------------------------
+  - name: pocketbuddy-db
+    databaseName: pocketbuddy
+    user: pocketbuddy_user
+    plan: free

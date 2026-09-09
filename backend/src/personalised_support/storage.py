@@ -8,38 +8,20 @@ in-memory (peer/analytics are session-scoped by design).
 
 import json
 import logging
-import sqlite3
-import os
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-from pathlib import Path
+
+try:
+    from db_postgres import get_db_cursor
+except ImportError:
+    from ..db_postgres import get_db_cursor
 
 logger = logging.getLogger(__name__)
 
 
-def _get_db_path() -> str:
-    here = Path(__file__).resolve()
-    for _ in range(6):
-        candidate = here / "database" / "pocketbuddy.db"
-        if candidate.exists():
-            return str(candidate)
-        here = here.parent
-    return os.getenv(
-        "SQLITE_DB_PATH",
-        str(Path(__file__).resolve().parents[4] / "database" / "pocketbuddy.db")
-    )
-
-
-def _db():
-    conn = sqlite3.connect(_get_db_path())
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
-
-
 class ConversationStorage:
     """
-    Persist conversation messages to the SQLite chat_history table.
+    Persist conversation messages to the PostgreSQL chat_history table.
     Falls back to in-memory storage if the DB is unavailable.
     """
 
@@ -61,22 +43,22 @@ class ConversationStorage:
         """Persist one chat turn to chat_history. User turn and assistant
         turn are each stored as separate rows."""
         try:
-            with _db() as conn:
-                conn.execute(
+            uid = int(user_id) if str(user_id).isdigit() else 0
+            with get_db_cursor(commit=True) as cur:
+                cur.execute(
                     """
                     INSERT INTO chat_history
                         (user_id, date, user_message, ai_response, context)
-                    VALUES (?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s)
                     """,
                     (
-                        int(user_id) if str(user_id).isdigit() else 0,
+                        uid,
                         datetime.now().strftime("%Y-%m-%d"),
                         content if role == "user"      else "",
                         content if role == "assistant" else "",
                         json.dumps({"role": role, "message_type": message_type}),
                     )
                 )
-                conn.commit()
         except Exception as e:
             logger.warning(f"chat_history DB write failed (non-fatal): {e}")
 
@@ -90,21 +72,22 @@ class ConversationStorage:
             uid = int(user_id) if str(user_id).isdigit() else 0
             query = (
                 "SELECT user_message, ai_response, context, created_at"
-                " FROM chat_history WHERE user_id=?"
+                " FROM chat_history WHERE user_id=%s"
                 " ORDER BY created_at ASC"
             )
             params: tuple = (uid,)
             if limit:
                 query = (
                     "SELECT user_message, ai_response, context, created_at"
-                    " FROM (SELECT * FROM chat_history WHERE user_id=?"
-                    "        ORDER BY created_at DESC LIMIT ?)"
+                    " FROM (SELECT * FROM chat_history WHERE user_id=%s"
+                    "        ORDER BY created_at DESC LIMIT %s) sub"
                     " ORDER BY created_at ASC"
                 )
                 params = (uid, limit)
 
-            with _db() as conn:
-                rows = conn.execute(query, params).fetchall()
+            with get_db_cursor() as cur:
+                cur.execute(query, params)
+                rows = cur.fetchall()
 
             messages = []
             for row in rows:
@@ -116,7 +99,7 @@ class ConversationStorage:
                         "role": role,
                         "content": content,
                         "message_type": ctx.get("message_type", role),
-                        "timestamp": row["created_at"],
+                        "timestamp": str(row["created_at"]),
                     })
             return messages
         except Exception as e:
@@ -127,9 +110,8 @@ class ConversationStorage:
         """Delete all chat history for a user from the DB."""
         try:
             uid = int(user_id) if str(user_id).isdigit() else 0
-            with _db() as conn:
-                conn.execute("DELETE FROM chat_history WHERE user_id=?", (uid,))
-                conn.commit()
+            with get_db_cursor(commit=True) as cur:
+                cur.execute("DELETE FROM chat_history WHERE user_id=%s", (uid,))
         except Exception as e:
             logger.warning(f"chat_history DB clear failed: {e}")
         self._meta.pop(user_id, None)

@@ -9,14 +9,19 @@ All features are derived — no schema changes needed.
 emergency_fund = monthly_income * 0.10  (derived, not stored)
 """
 
+import os
 import sqlite3
+from typing import Dict, List, Tuple, Optional
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
 from statistics import mean, stdev
 
 from .schemas import FinancialFeatures, MentalFeatures
 
+try:
+    from db_postgres import get_db_cursor
+except ImportError:
+    from ..db_postgres import get_db_cursor
 
 # Mood encoding: maps raw mood strings to numeric scores
 MOOD_SCORES: Dict[str, float] = {
@@ -28,13 +33,24 @@ MOOD_SCORES: Dict[str, float] = {
 }
 
 
+class DBWrapper:
+    """Wrapper around psycopg2 RealDictCursor to maintain SQLite-compatible API."""
+    def __init__(self, cursor):
+        self.cursor = cursor
+
+    def execute(self, sql: str, params=()):
+        formatted_sql = sql.replace("?", "%s")
+        self.cursor.execute(formatted_sql, params)
+        return self.cursor
+
+
 class FeatureEngineer:
     """
-    Extracts and engineers features from SQLite for a given user.
+    Extracts and engineers features from PostgreSQL for a given user.
     All queries are read-only — never modifies the database.
     """
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: Optional[str] = None):
         self.db_path = db_path
 
     # ------------------------------------------------------------------
@@ -404,7 +420,7 @@ class FeatureEngineer:
     # Mental helpers
     # ------------------------------------------------------------------
 
-    def _health_logs(self, conn, user_id: int, days: int) -> List[sqlite3.Row]:
+    def _health_logs(self, conn, user_id: int, days: int) -> List[Dict]:
         cutoff = (datetime.now().date() - timedelta(days=days)).isoformat()
         return conn.execute(
             """
@@ -485,7 +501,7 @@ class FeatureEngineer:
         return streak
 
     def _goal_metrics(
-        self, conn, user_id: int, logs_7d: List[sqlite3.Row]
+        self, conn, user_id: int, logs_7d: List[Dict]
     ) -> Tuple[float, int]:
         """
         Returns (completion_rate 0-1, missed_goals_count).
@@ -798,14 +814,17 @@ class FeatureEngineer:
 
     @contextmanager
     def _conn(self):
-        """Context manager that opens, yields, and always closes the connection."""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        try:
-            yield conn
-        finally:
-            conn.close()
+        """Context manager yielding SQLite connection if db_path is set, else PostgreSQL cursor wrapper."""
+        if self.db_path and os.path.exists(self.db_path):
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                yield conn
+            finally:
+                conn.close()
+        else:
+            with get_db_cursor() as cursor:
+                yield DBWrapper(cursor)
 
     @staticmethod
     def _days_in_month(d) -> int:

@@ -1,5 +1,5 @@
 // ============================================================
-// FEATURE 2: RECOMMENDED FOOD
+// FEATURE 2: RECOMMENDED FOOD - PostgreSQL Edition
 // Track food spending, suggest budget meals, analyze diet
 // ============================================================
 const express = require('express');
@@ -8,7 +8,7 @@ const router = express.Router();
 module.exports = function (db, authenticateToken) {
 
     // POST /api/food/log - Log a meal
-    router.post('/log', authenticateToken, (req, res) => {
+    router.post('/log', authenticateToken, async (req, res) => {
         try {
             const { food_name, cost, calories, meal_type, is_homemade, date } = req.body;
 
@@ -20,14 +20,15 @@ module.exports = function (db, authenticateToken) {
             const validMealTypes = ['breakfast', 'lunch', 'dinner', 'snack', 'other'];
             const type = validMealTypes.includes(meal_type) ? meal_type : 'other';
 
-            const result = db.prepare(`
-        INSERT INTO food_logs (user_id, date, meal_type, food_name, cost, calories, is_homemade)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(req.user.id, mealDate, type, food_name, cost || 0, calories || 0, is_homemade ? 1 : 0);
+            const result = await db.query(`
+                INSERT INTO food_logs (user_id, date, meal_type, food_name, cost, calories, is_homemade)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id
+            `, [req.user.id, mealDate, type, food_name, cost || 0, calories || 0, is_homemade ? 1 : 0]);
 
             res.status(201).json({
                 message: 'Meal logged!',
-                food: { id: result.lastInsertRowid, food_name, cost, calories, meal_type: type, date: mealDate }
+                food: { id: result.rows[0].id, food_name, cost, calories, meal_type: type, date: mealDate }
             });
         } catch (err) {
             console.error('Log food error:', err);
@@ -36,23 +37,26 @@ module.exports = function (db, authenticateToken) {
     });
 
     // GET /api/food/recommendations - Get personalized meal suggestions
-    router.get('/recommendations', authenticateToken, (req, res) => {
+    router.get('/recommendations', authenticateToken, async (req, res) => {
         try {
             // Step 1: Calculate user's average daily food spend (last 7 days)
-            const spendData = db.prepare(`
-        SELECT COALESCE(SUM(cost), 0) as total, COUNT(DISTINCT date) as days
-        FROM food_logs
-        WHERE user_id = ? AND date >= date('now', '-7 days')
-      `).get(req.user.id);
+            const spendDataRes = await db.query(`
+                SELECT COALESCE(SUM(cost), 0) as total, COUNT(DISTINCT date) as days
+                FROM food_logs
+                WHERE user_id = $1 AND date::date >= (CURRENT_DATE - INTERVAL '7 days')
+            `, [req.user.id]);
 
-            const daysWithData = spendData.days || 1;
-            const dailyFoodSpend = spendData.total / daysWithData;
+            const spendData = spendDataRes.rows[0];
+            const daysWithData = parseInt(spendData.days, 10) || 1;
+            const dailyFoodSpend = (parseFloat(spendData.total) || 0) / daysWithData;
 
             // Step 2: Get user dietary preferences
-            const user = db.prepare('SELECT dietary_preferences FROM users WHERE id = ?').get(req.user.id);
+            const userRes = await db.query('SELECT dietary_preferences FROM users WHERE id = $1', [req.user.id]);
+            const user = userRes.rows[0];
+
             let preferences = [];
             try {
-                preferences = JSON.parse(user.dietary_preferences || '[]');
+                preferences = JSON.parse(user?.dietary_preferences || '[]');
             } catch (e) {
                 preferences = [];
             }
@@ -60,10 +64,8 @@ module.exports = function (db, authenticateToken) {
             // Step 3: Build meal query based on budget and preferences
             let mealQuery = 'SELECT * FROM budget_meals WHERE 1=1';
             const params = [];
+            let paramIdx = 1;
 
-            // If user spends > ₹500/day, show budget meals under ₹250
-            // If user spends ₹300-₹500/day, show meals matching their range
-            // If user spends < ₹300/day, encourage healthy eating
             let maxCost = 250;
             if (dailyFoodSpend <= 300) {
                 maxCost = 300;
@@ -73,7 +75,7 @@ module.exports = function (db, authenticateToken) {
                 maxCost = 200; // Show cheaper options for overspenders
             }
 
-            mealQuery += ' AND cost <= ?';
+            mealQuery += ` AND cost <= $${paramIdx++}`;
             params.push(maxCost);
 
             // Apply dietary filters
@@ -86,7 +88,11 @@ module.exports = function (db, authenticateToken) {
 
             mealQuery += ' ORDER BY RANDOM() LIMIT 10';
 
-            const meals = db.prepare(mealQuery).all(...params);
+            const mealsRes = await db.query(mealQuery, params);
+            const meals = mealsRes.rows.map(m => ({
+                ...m,
+                cost: parseFloat(m.cost)
+            }));
 
             // Step 4: Build response with context
             let advice = '';
@@ -112,35 +118,55 @@ module.exports = function (db, authenticateToken) {
     });
 
     // GET /api/food/budget-analysis - Compare actual spend vs budget
-    router.get('/budget-analysis', authenticateToken, (req, res) => {
+    router.get('/budget-analysis', authenticateToken, async (req, res) => {
         try {
             // Daily breakdown for last 7 days
-            const dailySpend = db.prepare(`
-        SELECT date, SUM(cost) as total, COUNT(*) as meals
-        FROM food_logs
-        WHERE user_id = ? AND date >= date('now', '-7 days')
-        GROUP BY date
-        ORDER BY date ASC
-      `).all(req.user.id);
+            const dailySpendRes = await db.query(`
+                SELECT date, SUM(cost) as total, COUNT(*) as meals
+                FROM food_logs
+                WHERE user_id = $1 AND date::date >= (CURRENT_DATE - INTERVAL '7 days')
+                GROUP BY date
+                ORDER BY date ASC
+            `, [req.user.id]);
+
+            const dailySpend = dailySpendRes.rows.map(r => ({
+                date: r.date,
+                total: parseFloat(r.total),
+                meals: parseInt(r.meals, 10)
+            }));
 
             // By meal type
-            const byMealType = db.prepare(`
-        SELECT meal_type, AVG(cost) as avg_cost, COUNT(*) as count
-        FROM food_logs
-        WHERE user_id = ? AND date >= date('now', '-7 days')
-        GROUP BY meal_type
-      `).all(req.user.id);
+            const byMealTypeRes = await db.query(`
+                SELECT meal_type, AVG(cost) as avg_cost, COUNT(*) as count
+                FROM food_logs
+                WHERE user_id = $1 AND date::date >= (CURRENT_DATE - INTERVAL '7 days')
+                GROUP BY meal_type
+            `, [req.user.id]);
+
+            const byMealType = byMealTypeRes.rows.map(r => ({
+                meal_type: r.meal_type,
+                avg_cost: parseFloat(r.avg_cost),
+                count: parseInt(r.count, 10)
+            }));
 
             // Homemade vs bought
-            const homemadeStats = db.prepare(`
-        SELECT
-          SUM(CASE WHEN is_homemade = 1 THEN 1 ELSE 0 END) as homemade_count,
-          SUM(CASE WHEN is_homemade = 0 THEN 1 ELSE 0 END) as bought_count,
-          AVG(CASE WHEN is_homemade = 1 THEN cost ELSE NULL END) as avg_homemade_cost,
-          AVG(CASE WHEN is_homemade = 0 THEN cost ELSE NULL END) as avg_bought_cost
-        FROM food_logs
-        WHERE user_id = ? AND date >= date('now', '-7 days')
-      `).get(req.user.id);
+            const homemadeStatsRes = await db.query(`
+                SELECT
+                    SUM(CASE WHEN is_homemade = 1 THEN 1 ELSE 0 END) as homemade_count,
+                    SUM(CASE WHEN is_homemade = 0 THEN 1 ELSE 0 END) as bought_count,
+                    AVG(CASE WHEN is_homemade = 1 THEN cost ELSE NULL END) as avg_homemade_cost,
+                    AVG(CASE WHEN is_homemade = 0 THEN cost ELSE NULL END) as avg_bought_cost
+                FROM food_logs
+                WHERE user_id = $1 AND date::date >= (CURRENT_DATE - INTERVAL '7 days')
+            `, [req.user.id]);
+
+            const h = homemadeStatsRes.rows[0];
+            const homemadeStats = {
+                homemade_count: parseInt(h.homemade_count || 0, 10),
+                bought_count: parseInt(h.bought_count || 0, 10),
+                avg_homemade_cost: h.avg_homemade_cost ? parseFloat(h.avg_homemade_cost) : null,
+                avg_bought_cost: h.avg_bought_cost ? parseFloat(h.avg_bought_cost) : null
+            };
 
             const totalSpent = dailySpend.reduce((sum, d) => sum + d.total, 0);
             const avgDaily = dailySpend.length > 0 ? totalSpent / dailySpend.length : 0;
@@ -165,18 +191,21 @@ module.exports = function (db, authenticateToken) {
     });
 
     // GET /api/food/log - Get food log history
-    router.get('/log', authenticateToken, (req, res) => {
+    router.get('/log', authenticateToken, async (req, res) => {
         try {
             const { days } = req.query;
-            const lookback = parseInt(days) || 7;
+            const lookback = parseInt(days, 10) || 7;
 
-            const logs = db.prepare(`
-        SELECT * FROM food_logs
-        WHERE user_id = ? AND date >= date('now', ?)
-        ORDER BY date DESC, created_at DESC
-      `).all(req.user.id, `-${lookback} days`);
+            const logsRes = await db.query(`
+                SELECT * FROM food_logs
+                WHERE user_id = $1 AND date::date >= (CURRENT_DATE - ($2 || ' days')::interval)
+                ORDER BY date DESC, created_at DESC
+            `, [req.user.id, lookback]);
 
-            res.json(logs);
+            res.json(logsRes.rows.map(r => ({
+                ...r,
+                cost: parseFloat(r.cost)
+            })));
         } catch (err) {
             console.error('Food log error:', err);
             res.status(500).json({ error: 'Failed to get food log.' });

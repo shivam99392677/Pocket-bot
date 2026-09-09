@@ -3,7 +3,7 @@
 // ============================================================
 import { getIdToken } from './firebase';
 
-const API_BASE = '/api';
+const API_BASE = process.env.REACT_APP_API_URL || '/api';
 
 // Get the auth token (Firebase ID token or stored JWT)
 async function getToken() {

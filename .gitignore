@@ -34,3 +34,5 @@ verify_db.py
 
 *.db-wal
 *.db-shm
+*.pkl
+backend/.env

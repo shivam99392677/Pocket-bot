@@ -204,20 +204,8 @@ try:
     from burnout_prediction.model_store import resolve_model_dir, delete_user_models
     from burnout_prediction.schemas import BurnoutPredictionResponse
 
-    # Locate pocketbuddy.db the same way sqlite_service.py does
-    def _find_db_path() -> str:
-        here = Path(__file__).resolve()
-        for _ in range(6):
-            candidate = here / "database" / "pocketbuddy.db"
-            if candidate.exists():
-                return str(candidate)
-            here = here.parent
-        import os as _os
-        return _os.getenv("SQLITE_DB_PATH", str(PROJECT_ROOT / "database" / "pocketbuddy.db"))
-
-    _DB_PATH = _find_db_path()
-    burnout_predictor = BurnoutPredictor(db_path=_DB_PATH)
-    print(f"[OK] Burnout Predictor initialised — db: {_DB_PATH}")
+    burnout_predictor = BurnoutPredictor()
+    print("[OK] Burnout Predictor initialised — db: PostgreSQL")
 except ImportError as e:
     print(f"[WARN] Burnout Prediction not available: {e}")
     burnout_predictor = None
@@ -249,11 +237,10 @@ burnout_predictor = None
 try:
     from burnout_prediction.burnout_predictor import BurnoutPredictor
     from wellness_engine import WellnessEngine
-    from expense_management.sqlite_service import DB_PATH
 
     wellness_engine = WellnessEngine()
-    burnout_predictor = BurnoutPredictor(DB_PATH)
-    print("[OK] Wellness & Burnout services initialized successfully")
+    burnout_predictor = BurnoutPredictor()
+    print("[OK] Wellness & Burnout services initialized successfully with PostgreSQL")
 except Exception as e:
     print(f"[WARN] Wellness & Burnout services initialization failed: {e}")
 
@@ -1059,14 +1046,24 @@ async def get_user_recommendations(user_id: str):
 # ║    Health check-in logging, burnout scoring, history, model management           ║
 # ╚════════════════════════════════════════════════════════════════════════════════╝
 
-import sqlite3 as _sqlite3
+from contextlib import contextmanager
+from db_postgres import get_db_cursor
 
-def _get_db_conn() -> _sqlite3.Connection:
-    """Open a WAL-mode SQLite connection to pocketbuddy.db."""
-    conn = _sqlite3.connect(_DB_PATH if burnout_predictor else str(PROJECT_ROOT / "database" / "pocketbuddy.db"))
-    conn.row_factory = _sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+class DBWrapper:
+    """Wrapper around psycopg2 RealDictCursor for SQLite-compatible API."""
+    def __init__(self, cursor):
+        self.cursor = cursor
+
+    def execute(self, sql: str, params=()):
+        formatted_sql = sql.replace("?", "%s")
+        self.cursor.execute(formatted_sql, params)
+        return self.cursor
+
+@contextmanager
+def _get_db_conn(commit=False):
+    """Context manager yielding PostgreSQL cursor wrapper."""
+    with get_db_cursor(commit=commit) as cursor:
+        yield DBWrapper(cursor)
 
 
 # ── 1. Log a daily health check-in ───────────────────────────────────────────
@@ -1084,7 +1081,7 @@ async def log_health_checkin(user_id: int, log: HealthLogCreate):
     """
     try:
         checkin_date = log.date or datetime.now().strftime("%Y-%m-%d")
-        with _get_db_conn() as conn:
+        with _get_db_conn(commit=True) as conn:
             conn.execute(
                 """
                 INSERT INTO health_logs
@@ -1093,14 +1090,14 @@ async def log_health_checkin(user_id: int, log: HealthLogCreate):
                      energy_level, notes)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id, date) DO UPDATE SET
-                    sleep_hours      = excluded.sleep_hours,
-                    stress_level     = excluded.stress_level,
-                    mood             = excluded.mood,
-                    study_hours      = excluded.study_hours,
-                    exercise_minutes = excluded.exercise_minutes,
-                    social_activity  = excluded.social_activity,
-                    energy_level     = excluded.energy_level,
-                    notes            = excluded.notes
+                    sleep_hours      = EXCLUDED.sleep_hours,
+                    stress_level     = EXCLUDED.stress_level,
+                    mood             = EXCLUDED.mood,
+                    study_hours      = EXCLUDED.study_hours,
+                    exercise_minutes = EXCLUDED.exercise_minutes,
+                    social_activity  = EXCLUDED.social_activity,
+                    energy_level     = EXCLUDED.energy_level,
+                    notes            = EXCLUDED.notes
                 """,
                 (
                     user_id, checkin_date,
@@ -1109,7 +1106,6 @@ async def log_health_checkin(user_id: int, log: HealthLogCreate):
                     log.social_activity, log.energy_level, log.notes,
                 ),
             )
-            conn.commit()
         return {
             "success": True,
             "user_id": user_id,
@@ -1226,7 +1222,7 @@ async def save_burnout_snapshot(user_id: int):
         fin_details = result.financial_details or {}
         men_details = result.mental_details or {}
 
-        with _get_db_conn() as conn:
+        with _get_db_conn(commit=True) as conn:
             conn.execute(
                 """
                 INSERT INTO burnout_scores
@@ -1234,11 +1230,11 @@ async def save_burnout_snapshot(user_id: int):
                      current_sleep, current_stress, current_exercise, score, alert_level)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id, date) DO UPDATE SET
-                    score       = excluded.score,
-                    alert_level = excluded.alert_level,
-                    current_sleep    = excluded.current_sleep,
-                    current_stress   = excluded.current_stress,
-                    current_exercise = excluded.current_exercise
+                    score       = EXCLUDED.score,
+                    alert_level = EXCLUDED.alert_level,
+                    current_sleep    = EXCLUDED.current_sleep,
+                    current_stress   = EXCLUDED.current_stress,
+                    current_exercise = EXCLUDED.current_exercise
                 """,
                 (
                     user_id, today,
@@ -1252,7 +1248,6 @@ async def save_burnout_snapshot(user_id: int):
                     result.alert_level.value,
                 ),
             )
-            conn.commit()
 
         return {
             "success": True,

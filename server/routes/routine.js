@@ -1,5 +1,5 @@
 // ============================================================
-// FEATURE 5: HEALTHY ROUTINE
+// FEATURE 5: HEALTHY ROUTINE - PostgreSQL Edition
 // Gradual habit building, progress tracking, adaptive goals
 // ============================================================
 const express = require('express');
@@ -8,7 +8,7 @@ const router = express.Router();
 module.exports = function (db, authenticateToken) {
 
     // POST /api/routine/goal - Set a new wellness goal
-    router.post('/goal', authenticateToken, (req, res) => {
+    router.post('/goal', authenticateToken, async (req, res) => {
         try {
             const { goal_type, target_value } = req.body;
 
@@ -24,23 +24,25 @@ module.exports = function (db, authenticateToken) {
             }
 
             // Get user's current baseline from health logs
-            const baseline = db.prepare(`
-        SELECT
-          AVG(sleep_hours) as avg_sleep,
-          AVG(exercise_minutes) as avg_exercise,
-          AVG(stress_level) as avg_stress,
-          AVG(study_hours) as avg_study
-        FROM health_logs
-        WHERE user_id = ? AND date >= date('now', '-7 days')
-      `).get(req.user.id);
+            const baselineRes = await db.query(`
+                SELECT
+                    AVG(sleep_hours) as avg_sleep,
+                    AVG(exercise_minutes) as avg_exercise,
+                    AVG(stress_level) as avg_stress,
+                    AVG(study_hours) as avg_study
+                FROM health_logs
+                WHERE user_id = $1 AND date::date >= (CURRENT_DATE - INTERVAL '7 days')
+            `, [req.user.id]);
+
+            const baseline = baselineRes.rows[0];
 
             // Determine current value based on goal type
             let currentValue = 0;
             switch (goal_type) {
-                case 'sleep': currentValue = baseline.avg_sleep || 6; break;
-                case 'exercise': currentValue = baseline.avg_exercise || 0; break;
-                case 'stress': currentValue = baseline.avg_stress || 5; break;
-                case 'study': currentValue = baseline.avg_study || 0; break;
+                case 'sleep': currentValue = parseFloat(baseline?.avg_sleep) || 6; break;
+                case 'exercise': currentValue = parseFloat(baseline?.avg_exercise) || 0; break;
+                case 'stress': currentValue = parseFloat(baseline?.avg_stress) || 5; break;
+                case 'study': currentValue = parseFloat(baseline?.avg_study) || 0; break;
                 default: currentValue = 0;
             }
 
@@ -50,21 +52,22 @@ module.exports = function (db, authenticateToken) {
             const weeklyTarget = currentValue + (gap * 0.25); // Week 1 target
 
             // Deactivate any existing goals of same type
-            db.prepare(`
-        UPDATE routine_goals SET status = 'completed'
-        WHERE user_id = ? AND goal_type = ? AND status = 'active'
-      `).run(req.user.id, goal_type);
+            await db.query(`
+                UPDATE routine_goals SET status = 'completed'
+                WHERE user_id = $1 AND goal_type = $2 AND status = 'active'
+            `, [req.user.id, goal_type]);
 
             // Create new goal
-            const result = db.prepare(`
-        INSERT INTO routine_goals (user_id, goal_type, current_value, target_value, weekly_target, week_number, status)
-        VALUES (?, ?, ?, ?, ?, 1, 'active')
-      `).run(req.user.id, goal_type, currentValue, target_value, weeklyTarget);
+            const result = await db.query(`
+                INSERT INTO routine_goals (user_id, goal_type, current_value, target_value, weekly_target, week_number, status)
+                VALUES ($1, $2, $3, $4, $5, 1, 'active')
+                RETURNING id
+            `, [req.user.id, goal_type, currentValue, target_value, weeklyTarget]);
 
             res.status(201).json({
                 message: 'Goal set! We\'ll build up gradually over 4 weeks.',
                 goal: {
-                    id: result.lastInsertRowid,
+                    id: result.rows[0].id,
                     goal_type,
                     current_value: Math.round(currentValue * 10) / 10,
                     target_value,
@@ -79,13 +82,19 @@ module.exports = function (db, authenticateToken) {
     });
 
     // GET /api/routine/plan - Get current weekly routine plan
-    router.get('/plan', authenticateToken, (req, res) => {
+    router.get('/plan', authenticateToken, async (req, res) => {
         try {
             // Get all active goals
-            const goals = db.prepare(`
-        SELECT * FROM routine_goals
-        WHERE user_id = ? AND status = 'active'
-      `).all(req.user.id);
+            const goalsRes = await db.query(`
+                SELECT * FROM routine_goals
+                WHERE user_id = $1 AND status = 'active'
+            `, [req.user.id]);
+            const goals = goalsRes.rows.map(g => ({
+                ...g,
+                current_value: parseFloat(g.current_value),
+                target_value: parseFloat(g.target_value),
+                weekly_target: parseFloat(g.weekly_target)
+            }));
 
             if (goals.length === 0) {
                 return res.json({
@@ -100,11 +109,19 @@ module.exports = function (db, authenticateToken) {
             }
 
             // Get recent health data to check progress
-            const recentHealth = db.prepare(`
-        SELECT * FROM health_logs
-        WHERE user_id = ? AND date >= date('now', '-7 days')
-        ORDER BY date DESC
-      `).all(req.user.id);
+            const recentHealthRes = await db.query(`
+                SELECT * FROM health_logs
+                WHERE user_id = $1 AND date::date >= (CURRENT_DATE - INTERVAL '7 days')
+                ORDER BY date DESC
+            `, [req.user.id]);
+
+            const recentHealth = recentHealthRes.rows.map(h => ({
+                ...h,
+                sleep_hours: parseFloat(h.sleep_hours),
+                exercise_minutes: parseInt(h.exercise_minutes, 10),
+                stress_level: parseInt(h.stress_level, 10),
+                study_hours: parseFloat(h.study_hours)
+            }));
 
             // Build weekly plan for each goal
             const plan = goals.map(goal => {
@@ -155,55 +172,60 @@ module.exports = function (db, authenticateToken) {
     });
 
     // POST /api/routine/checkin - Log routine completion (separate from health check-in)
-    router.post('/checkin', authenticateToken, (req, res) => {
+    router.post('/checkin', authenticateToken, async (req, res) => {
         try {
-            const { goal_type, value, date } = req.body;
+            const { goal_type, value } = req.body;
 
             if (!goal_type || value === undefined) {
                 return res.status(400).json({ error: 'Goal type and value are required.' });
             }
 
             // Find the active goal
-            const goal = db.prepare(`
-        SELECT * FROM routine_goals
-        WHERE user_id = ? AND goal_type = ? AND status = 'active'
-      `).get(req.user.id, goal_type);
+            const goalRes = await db.query(`
+                SELECT * FROM routine_goals
+                WHERE user_id = $1 AND goal_type = $2 AND status = 'active'
+            `, [req.user.id, goal_type]);
+            const goal = goalRes.rows[0];
 
             if (!goal) {
                 return res.status(404).json({ error: `No active ${goal_type} goal found.` });
             }
 
             // Check if it's time to advance to next week (every 7 days)
-            const goalAge = db.prepare(`
-        SELECT julianday('now') - julianday(created_at) as days_active
-        FROM routine_goals WHERE id = ?
-      `).get(goal.id);
+            const goalAgeRes = await db.query(`
+                SELECT EXTRACT(DAY FROM (NOW() - created_at)) as days_active
+                FROM routine_goals WHERE id = $1
+            `, [goal.id]);
 
-            const expectedWeek = Math.floor(goalAge.days_active / 7) + 1;
+            const daysActive = parseFloat(goalAgeRes.rows[0]?.days_active || 0);
+            const expectedWeek = Math.floor(daysActive / 7) + 1;
 
             if (expectedWeek > goal.week_number && expectedWeek <= 4) {
                 // Advance to next week with increased target
-                const gap = goal.target_value - goal.current_value;
-                const newWeeklyTarget = goal.current_value + (gap * 0.25 * expectedWeek);
+                const gap = parseFloat(goal.target_value) - parseFloat(goal.current_value);
+                const newWeeklyTarget = parseFloat(goal.current_value) + (gap * 0.25 * expectedWeek);
 
-                db.prepare(`
-          UPDATE routine_goals SET week_number = ?, weekly_target = ?
-          WHERE id = ?
-        `).run(expectedWeek, newWeeklyTarget, goal.id);
+                await db.query(`
+                    UPDATE routine_goals SET week_number = $1, weekly_target = $2
+                    WHERE id = $3
+                `, [expectedWeek, newWeeklyTarget, goal.id]);
+
+                goal.weekly_target = newWeeklyTarget;
             }
 
             // Celebrate if target met
-            const metTarget = value >= goal.weekly_target;
+            const weeklyTarget = parseFloat(goal.weekly_target);
+            const metTarget = value >= weeklyTarget;
 
             res.json({
                 message: metTarget ? '🎉 Great job! You hit your target!' : 'Logged! Keep pushing toward your goal.',
                 goal_type,
                 value,
-                weekly_target: goal.weekly_target,
+                weekly_target: weeklyTarget,
                 met_target: metTarget,
                 encouragement: metTarget
                     ? 'You\'re building this habit! Consistency is key.'
-                    : `You're at ${value}, target is ${goal.weekly_target}. Small steps count!`
+                    : `You're at ${value}, target is ${weeklyTarget}. Small steps count!`
             });
         } catch (err) {
             console.error('Routine checkin error:', err);
@@ -212,19 +234,33 @@ module.exports = function (db, authenticateToken) {
     });
 
     // GET /api/routine/progress - Track progress over time
-    router.get('/progress', authenticateToken, (req, res) => {
+    router.get('/progress', authenticateToken, async (req, res) => {
         try {
-            const goals = db.prepare(`
-        SELECT * FROM routine_goals WHERE user_id = ? ORDER BY created_at DESC
-      `).all(req.user.id);
+            const goalsRes = await db.query(`
+                SELECT * FROM routine_goals WHERE user_id = $1 ORDER BY created_at DESC
+            `, [req.user.id]);
+            const goals = goalsRes.rows.map(g => ({
+                ...g,
+                current_value: parseFloat(g.current_value),
+                target_value: parseFloat(g.target_value),
+                weekly_target: parseFloat(g.weekly_target)
+            }));
 
             // Get health data for progress calculation
-            const healthData = db.prepare(`
-        SELECT date, sleep_hours, exercise_minutes, stress_level, study_hours
-        FROM health_logs
-        WHERE user_id = ?
-        ORDER BY date ASC
-      `).all(req.user.id);
+            const healthDataRes = await db.query(`
+                SELECT date, sleep_hours, exercise_minutes, stress_level, study_hours
+                FROM health_logs
+                WHERE user_id = $1
+                ORDER BY date ASC
+            `, [req.user.id]);
+
+            const healthData = healthDataRes.rows.map(h => ({
+                date: h.date,
+                sleep_hours: parseFloat(h.sleep_hours),
+                exercise_minutes: parseInt(h.exercise_minutes, 10),
+                stress_level: parseInt(h.stress_level, 10),
+                study_hours: parseFloat(h.study_hours)
+            }));
 
             // Calculate week-over-week progress for each goal type
             const progress = goals.map(goal => {
@@ -270,18 +306,20 @@ module.exports = function (db, authenticateToken) {
     });
 
     // GET /api/routine/tips - Get daily tips based on current state
-    router.get('/tips', authenticateToken, (req, res) => {
+    router.get('/tips', authenticateToken, async (req, res) => {
         try {
             // Get latest health data
-            const latest = db.prepare(`
-        SELECT * FROM health_logs WHERE user_id = ? ORDER BY date DESC LIMIT 1
-      `).get(req.user.id);
+            const latestRes = await db.query(`
+                SELECT * FROM health_logs WHERE user_id = $1 ORDER BY date DESC LIMIT 1
+            `, [req.user.id]);
+            const latest = latestRes.rows[0];
 
             // Get active goals
-            const goals = db.prepare(`
-        SELECT goal_type, weekly_target FROM routine_goals
-        WHERE user_id = ? AND status = 'active'
-      `).all(req.user.id);
+            const goalsRes = await db.query(`
+                SELECT goal_type, weekly_target FROM routine_goals
+                WHERE user_id = $1 AND status = 'active'
+            `, [req.user.id]);
+            const goals = goalsRes.rows;
 
             const tips = [];
 
@@ -290,31 +328,31 @@ module.exports = function (db, authenticateToken) {
                 tips.push('Set your first wellness goal to build healthy habits.');
             } else {
                 // Contextual tips based on data
-                if (latest.sleep_hours < 6) {
+                if (parseFloat(latest.sleep_hours) < 6) {
                     tips.push('You slept less than 6 hours. Try a 20-minute nap between classes.');
                     tips.push('Avoid caffeine after 2 PM to improve tonight\'s sleep.');
                 }
-                if (latest.stress_level >= 7) {
+                if (parseInt(latest.stress_level, 10) >= 7) {
                     tips.push('High stress today. Try 5 deep breaths right now (box breathing: 4-4-4-4).');
                     tips.push('Step outside for 2 minutes. A change of scenery helps reset your mind.');
                 }
-                if (latest.exercise_minutes === 0) {
+                if (parseInt(latest.exercise_minutes, 10) === 0) {
                     tips.push('No exercise today yet. A 10-minute walk between classes counts!');
                 }
                 if (latest.mood === 'anxious') {
                     tips.push('Feeling anxious? Write down 3 things in your control right now.');
                 }
-                if (latest.study_hours > 6) {
+                if (parseFloat(latest.study_hours) > 6) {
                     tips.push('You\'ve studied a lot today. Remember: rest makes studying more effective.');
                 }
 
                 // Goal-based tips
                 goals.forEach(g => {
                     if (g.goal_type === 'sleep') {
-                        tips.push(`Sleep goal: aim for ${g.weekly_target} hours tonight. Set an alarm to start winding down.`);
+                        tips.push(`Sleep goal: aim for ${parseFloat(g.weekly_target)} hours tonight. Set an alarm to start winding down.`);
                     }
                     if (g.goal_type === 'exercise') {
-                        tips.push(`Exercise goal: ${g.weekly_target} minutes. Even stretching at your desk helps!`);
+                        tips.push(`Exercise goal: ${parseFloat(g.weekly_target)} minutes. Even stretching at your desk helps!`);
                     }
                 });
             }

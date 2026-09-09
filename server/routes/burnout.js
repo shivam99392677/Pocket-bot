@@ -1,5 +1,5 @@
 // ============================================================
-// FEATURE 4: BURNOUT DETECTION (Most Important Feature)
+// FEATURE 4: BURNOUT DETECTION - PostgreSQL Edition
 // Daily check-ins, baseline comparison, early warning system
 // ============================================================
 const express = require('express');
@@ -31,28 +31,28 @@ module.exports = function (db, authenticateToken) {
             const checkinDate = date || new Date().toISOString().split('T')[0];
 
             // Insert or update today's check-in (one per day)
-            db.prepare(`
-        INSERT INTO health_logs (user_id, date, sleep_hours, stress_level, mood, study_hours, exercise_minutes, social_activity, energy_level, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, date) DO UPDATE SET
-          sleep_hours = excluded.sleep_hours,
-          stress_level = excluded.stress_level,
-          mood = excluded.mood,
-          study_hours = excluded.study_hours,
-          exercise_minutes = excluded.exercise_minutes,
-          social_activity = excluded.social_activity,
-          energy_level = excluded.energy_level,
-          notes = excluded.notes
-      `).run(
+            await db.query(`
+                INSERT INTO health_logs (user_id, date, sleep_hours, stress_level, mood, study_hours, exercise_minutes, social_activity, energy_level, notes)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT(user_id, date) DO UPDATE SET
+                    sleep_hours = EXCLUDED.sleep_hours,
+                    stress_level = EXCLUDED.stress_level,
+                    mood = EXCLUDED.mood,
+                    study_hours = EXCLUDED.study_hours,
+                    exercise_minutes = EXCLUDED.exercise_minutes,
+                    social_activity = EXCLUDED.social_activity,
+                    energy_level = EXCLUDED.energy_level,
+                    notes = EXCLUDED.notes
+            `, [
                 req.user.id, checkinDate,
                 sleep_hours, stress_level, mood.toLowerCase(),
                 study_hours || 0, exercise_minutes || 0,
                 social_activity || 0, energy_level || 5,
                 notes || ''
-            );
+            ]);
 
             // Calculate and store baseline burnout score
-            const burnoutResult = calculateBurnoutScore(db, req.user.id, checkinDate);
+            const burnoutResult = await calculateBurnoutScore(db, req.user.id, checkinDate);
 
             // Try to overwrite with high-fidelity ML burnout prediction
             try {
@@ -63,12 +63,12 @@ module.exports = function (db, authenticateToken) {
                     let alertVal = "good";
                     if (pythonData.risk_level === "high") alertVal = "high";
                     else if (pythonData.risk_level === "medium") alertVal = "moderate";
-                    
-                    db.prepare(`
+
+                    await db.query(`
                         UPDATE burnout_scores
-                        SET score = ?, alert_level = ?
-                        WHERE user_id = ? AND date = ?
-                    `).run(mlScore10, alertVal, req.user.id, checkinDate);
+                        SET score = $1, alert_level = $2
+                        WHERE user_id = $3 AND date = $4
+                    `, [mlScore10, alertVal, req.user.id, checkinDate]);
 
                     burnoutResult.score = mlScore10;
                     burnoutResult.alert_level = alertVal;
@@ -93,14 +93,16 @@ module.exports = function (db, authenticateToken) {
     router.get('/score', authenticateToken, async (req, res) => {
         try {
             // Count total check-in days
-            const checkinCount = db.prepare(`
-        SELECT COUNT(*) as days FROM health_logs WHERE user_id = ?
-      `).get(req.user.id);
+            const checkinCountRes = await db.query(`
+                SELECT COUNT(*) as days FROM health_logs WHERE user_id = $1
+            `, [req.user.id]);
+            const checkinDays = parseInt(checkinCountRes.rows[0].days, 10);
 
             // Get most recent daily check-in log
-            const latestCheckin = db.prepare(`
-        SELECT * FROM health_logs WHERE user_id = ? ORDER BY date DESC LIMIT 1
-      `).get(req.user.id);
+            const latestCheckinRes = await db.query(`
+                SELECT * FROM health_logs WHERE user_id = $1 ORDER BY date DESC LIMIT 1
+            `, [req.user.id]);
+            const latestCheckin = latestCheckinRes.rows[0] || null;
 
             let pythonBurnout = null;
             try {
@@ -117,8 +119,8 @@ module.exports = function (db, authenticateToken) {
                     score: null,
                     alert_level: 'unknown',
                     message: 'No burnout data yet. Complete daily check-ins for at least 7 days to get your score.',
-                    days_logged: checkinCount.days,
-                    days_needed: Math.max(0, 4 - checkinCount.days),
+                    days_logged: checkinDays,
+                    days_needed: Math.max(0, 4 - checkinDays),
                     latest_checkin: latestCheckin
                 });
             }
@@ -145,7 +147,7 @@ module.exports = function (db, authenticateToken) {
                 alert_level: alert_level,
                 date: new Date().toISOString().split('T')[0],
                 interpretation,
-                days_logged: checkinCount.days,
+                days_logged: checkinDays,
                 latest_checkin: latestCheckin
             });
         } catch (err) {
@@ -155,43 +157,45 @@ module.exports = function (db, authenticateToken) {
     });
 
     // GET /api/burnout/alert - Get burnout warnings
-    router.get('/alert', authenticateToken, (req, res) => {
+    router.get('/alert', authenticateToken, async (req, res) => {
         try {
-            const latest = db.prepare(`
-        SELECT * FROM burnout_scores
-        WHERE user_id = ?
-        ORDER BY date DESC LIMIT 1
-      `).get(req.user.id);
+            const latestRes = await db.query(`
+                SELECT * FROM burnout_scores
+                WHERE user_id = $1
+                ORDER BY date DESC LIMIT 1
+            `, [req.user.id]);
+            const latest = latestRes.rows[0];
 
             if (!latest || latest.score <= 3) {
                 return res.json({ has_alert: false, message: 'You\'re doing well! Keep it up.' });
             }
 
             // Get recent health data for context
-            const recentHealth = db.prepare(`
-        SELECT * FROM health_logs
-        WHERE user_id = ?
-        ORDER BY date DESC LIMIT 3
-      `).all(req.user.id);
+            const recentHealthRes = await db.query(`
+                SELECT * FROM health_logs
+                WHERE user_id = $1
+                ORDER BY date DESC LIMIT 3
+            `, [req.user.id]);
+            const recentHealth = recentHealthRes.rows;
 
             // Build specific warnings based on what's declining
             const warnings = [];
 
-            if (latest.current_sleep < latest.baseline_sleep - 1) {
+            if (parseFloat(latest.current_sleep) < parseFloat(latest.baseline_sleep) - 1) {
                 warnings.push({
                     type: 'sleep',
-                    message: `Your sleep dropped to ${latest.current_sleep.toFixed(1)}hrs (baseline: ${latest.baseline_sleep.toFixed(1)}hrs). Try to get more rest.`
+                    message: `Your sleep dropped to ${parseFloat(latest.current_sleep).toFixed(1)}hrs (baseline: ${parseFloat(latest.baseline_sleep).toFixed(1)}hrs). Try to get more rest.`
                 });
             }
 
-            if (latest.current_stress > latest.baseline_stress + 1.5) {
+            if (parseFloat(latest.current_stress) > parseFloat(latest.baseline_stress) + 1.5) {
                 warnings.push({
                     type: 'stress',
-                    message: `Your stress level is ${latest.current_stress.toFixed(1)}/10 (baseline: ${latest.baseline_stress.toFixed(1)}/10). Consider taking breaks.`
+                    message: `Your stress level is ${parseFloat(latest.current_stress).toFixed(1)}/10 (baseline: ${parseFloat(latest.baseline_stress).toFixed(1)}/10). Consider taking breaks.`
                 });
             }
 
-            if (latest.current_exercise < 10) {
+            if (parseFloat(latest.current_exercise) < 10) {
                 warnings.push({
                     type: 'exercise',
                     message: 'You haven\'t been exercising much. Even a 5-minute walk helps!'
@@ -221,26 +225,41 @@ module.exports = function (db, authenticateToken) {
     });
 
     // GET /api/burnout/trends - 30-day burnout trends
-    router.get('/trends', authenticateToken, (req, res) => {
+    router.get('/trends', authenticateToken, async (req, res) => {
         try {
             const { days } = req.query;
-            const lookback = parseInt(days) || 30;
+            const lookback = parseInt(days, 10) || 30;
 
             // Burnout scores over time
-            const scores = db.prepare(`
-        SELECT date, score, alert_level, current_sleep, current_stress, current_exercise
-        FROM burnout_scores
-        WHERE user_id = ? AND date >= date('now', ?)
-        ORDER BY date ASC
-      `).all(req.user.id, `-${lookback} days`);
+            const scoresRes = await db.query(`
+                SELECT date, score, alert_level, current_sleep, current_stress, current_exercise
+                FROM burnout_scores
+                WHERE user_id = $1 AND date::date >= (CURRENT_DATE - ($2 || ' days')::interval)
+                ORDER BY date ASC
+            `, [req.user.id, lookback]);
+
+            const scores = scoresRes.rows.map(r => ({
+                ...r,
+                current_sleep: parseFloat(r.current_sleep),
+                current_stress: parseFloat(r.current_stress),
+                current_exercise: parseFloat(r.current_exercise)
+            }));
 
             // Health log trends
-            const healthTrends = db.prepare(`
-        SELECT date, sleep_hours, stress_level, mood, exercise_minutes, energy_level
-        FROM health_logs
-        WHERE user_id = ? AND date >= date('now', ?)
-        ORDER BY date ASC
-      `).all(req.user.id, `-${lookback} days`);
+            const healthTrendsRes = await db.query(`
+                SELECT date, sleep_hours, stress_level, mood, exercise_minutes, energy_level
+                FROM health_logs
+                WHERE user_id = $1 AND date::date >= (CURRENT_DATE - ($2 || ' days')::interval)
+                ORDER BY date ASC
+            `, [req.user.id, lookback]);
+
+            const healthTrends = healthTrendsRes.rows.map(h => ({
+                ...h,
+                sleep_hours: parseFloat(h.sleep_hours),
+                stress_level: parseInt(h.stress_level, 10),
+                exercise_minutes: parseInt(h.exercise_minutes, 10),
+                energy_level: parseInt(h.energy_level, 10)
+            }));
 
             // Calculate averages for the period
             const avgSleep = healthTrends.reduce((sum, h) => sum + h.sleep_hours, 0) / (healthTrends.length || 1);
@@ -292,13 +311,15 @@ module.exports = function (db, authenticateToken) {
                 });
             }
 
-            const latest = db.prepare(`
-        SELECT * FROM burnout_scores WHERE user_id = ? ORDER BY date DESC LIMIT 1
-      `).get(req.user.id);
+            const latestRes = await db.query(`
+                SELECT * FROM burnout_scores WHERE user_id = $1 ORDER BY date DESC LIMIT 1
+            `, [req.user.id]);
+            const latest = latestRes.rows[0];
 
-            const recentHealth = db.prepare(`
-        SELECT * FROM health_logs WHERE user_id = ? ORDER BY date DESC LIMIT 7
-      `).all(req.user.id);
+            const recentHealthRes = await db.query(`
+                SELECT * FROM health_logs WHERE user_id = $1 ORDER BY date DESC LIMIT 7
+            `, [req.user.id]);
+            const recentHealth = recentHealthRes.rows;
 
             if (!latest) {
                 return res.json({
@@ -311,7 +332,7 @@ module.exports = function (db, authenticateToken) {
 
             // Add personalized tips based on specific data
             if (recentHealth.length > 0) {
-                const avgStudy = recentHealth.reduce((s, h) => s + h.study_hours, 0) / recentHealth.length;
+                const avgStudy = recentHealth.reduce((s, h) => s + parseFloat(h.study_hours), 0) / recentHealth.length;
                 if (avgStudy > 8) {
                     recs.push('You\'re studying ' + avgStudy.toFixed(1) + ' hours/day on average. Schedule breaks every 45 minutes.');
                 }
@@ -333,74 +354,83 @@ module.exports = function (db, authenticateToken) {
 };
 
 // ============================================================
-// BURNOUT SCORE ALGORITHM
-// Compares current metrics to user's personal baseline
+// BURNOUT SCORE ALGORITHM - PostgreSQL Edition
 // ============================================================
-function calculateBurnoutScore(db, userId, date) {
-    // Count how many days of data we have
-    const dayCount = db.prepare(`
-    SELECT COUNT(*) as days FROM health_logs WHERE user_id = ?
-  `).get(userId);
+async function calculateBurnoutScore(db, userId, date) {
+    const dayCountRes = await db.query(`
+        SELECT COUNT(*) as days FROM health_logs WHERE user_id = $1
+    `, [userId]);
+    const dayCount = parseInt(dayCountRes.rows[0].days, 10);
 
     // Need at least 7 days for a baseline
-    if (dayCount.days < 7) {
+    if (dayCount < 7) {
         return {
             score: null,
-            message: `Need ${7 - dayCount.days} more days of data to calculate burnout score.`,
-            days_until_baseline: 7 - dayCount.days
+            message: `Need ${7 - dayCount} more days of data to calculate burnout score.`,
+            days_until_baseline: 7 - dayCount
         };
     }
 
     // STEP 1: Get baseline (first 7 days of data)
-    const baseline = db.prepare(`
-    SELECT
-      AVG(sleep_hours) as avg_sleep,
-      AVG(stress_level) as avg_stress,
-      AVG(exercise_minutes) as avg_exercise
-    FROM (
-      SELECT sleep_hours, stress_level, exercise_minutes
-      FROM health_logs
-      WHERE user_id = ?
-      ORDER BY date ASC
-      LIMIT 7
-    )
-  `).get(userId);
+    const baselineRes = await db.query(`
+        SELECT
+            AVG(sleep_hours) as avg_sleep,
+            AVG(stress_level) as avg_stress,
+            AVG(exercise_minutes) as avg_exercise
+        FROM (
+            SELECT sleep_hours, stress_level, exercise_minutes
+            FROM health_logs
+            WHERE user_id = $1
+            ORDER BY date ASC
+            LIMIT 7
+        ) sub
+    `, [userId]);
+    const baseline = baselineRes.rows[0];
+    const bSleep = parseFloat(baseline.avg_sleep) || 0;
+    const bStress = parseFloat(baseline.avg_stress) || 0;
+    const bExercise = parseFloat(baseline.avg_exercise) || 0;
 
     // STEP 2: Get current averages (last 7 days)
-    const current = db.prepare(`
-    SELECT
-      AVG(sleep_hours) as avg_sleep,
-      AVG(stress_level) as avg_stress,
-      AVG(exercise_minutes) as avg_exercise
-    FROM health_logs
-    WHERE user_id = ? AND date >= date(?, '-7 days')
-  `).get(userId, date);
+    const currentRes = await db.query(`
+        SELECT
+            AVG(sleep_hours) as avg_sleep,
+            AVG(stress_level) as avg_stress,
+            AVG(exercise_minutes) as avg_exercise
+        FROM health_logs
+        WHERE user_id = $1 AND date::date >= ($2::date - INTERVAL '7 days')
+    `, [userId, date]);
+    const current = currentRes.rows[0];
+    const cSleep = parseFloat(current.avg_sleep) || 0;
+    const cStress = parseFloat(current.avg_stress) || 0;
+    const cExercise = parseFloat(current.avg_exercise) || 0;
 
     // Get today's mood
-    const todayMood = db.prepare(`
-    SELECT mood FROM health_logs WHERE user_id = ? AND date = ?
-  `).get(userId, date);
+    const todayMoodRes = await db.query(`
+        SELECT mood FROM health_logs WHERE user_id = $1 AND date = $2
+    `, [userId, date]);
+    const todayMood = todayMoodRes.rows[0];
 
     // Count days with no exercise in last 7 days
-    const noExerciseDays = db.prepare(`
-    SELECT COUNT(*) as days
-    FROM health_logs
-    WHERE user_id = ? AND date >= date(?, '-7 days') AND exercise_minutes < 5
-  `).get(userId, date);
+    const noExerciseDaysRes = await db.query(`
+        SELECT COUNT(*) as days
+        FROM health_logs
+        WHERE user_id = $1 AND date::date >= ($2::date - INTERVAL '7 days') AND exercise_minutes < 5
+    `, [userId, date]);
+    const noExerciseDays = parseInt(noExerciseDaysRes.rows[0].days, 10);
 
     // STEP 3: Calculate penalties
     let score = 0;
 
     // Sleep penalty: +2 if sleeping 1.5+ hours less than baseline
-    const sleepDrop = baseline.avg_sleep - (current.avg_sleep || 0);
+    const sleepDrop = bSleep - cSleep;
     if (sleepDrop > 1.5) score += 2;
 
     // Stress penalty: +2 if stress is 2+ points above baseline
-    const stressRise = (current.avg_stress || 0) - baseline.avg_stress;
+    const stressRise = cStress - bStress;
     if (stressRise > 2) score += 2;
 
     // Exercise penalty: +1 if less than 2 days of exercise in last 7
-    if (noExerciseDays.days >= 5) score += 1;
+    if (noExerciseDays >= 5) score += 1;
 
     // Mood penalty: +2 if currently overwhelmed
     if (todayMood && todayMood.mood === 'overwhelmed') score += 2;
@@ -416,31 +446,31 @@ function calculateBurnoutScore(db, userId, date) {
     else alertLevel = 'good';
 
     // STEP 5: Store the score
-    db.prepare(`
-    INSERT INTO burnout_scores (user_id, date, baseline_sleep, baseline_stress, baseline_exercise, current_sleep, current_stress, current_exercise, score, alert_level)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(user_id, date) DO UPDATE SET
-      baseline_sleep = excluded.baseline_sleep,
-      baseline_stress = excluded.baseline_stress,
-      baseline_exercise = excluded.baseline_exercise,
-      current_sleep = excluded.current_sleep,
-      current_stress = excluded.current_stress,
-      current_exercise = excluded.current_exercise,
-      score = excluded.score,
-      alert_level = excluded.alert_level
-  `).run(
+    await db.query(`
+        INSERT INTO burnout_scores (user_id, date, baseline_sleep, baseline_stress, baseline_exercise, current_sleep, current_stress, current_exercise, score, alert_level)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ON CONFLICT(user_id, date) DO UPDATE SET
+            baseline_sleep = EXCLUDED.baseline_sleep,
+            baseline_stress = EXCLUDED.baseline_stress,
+            baseline_exercise = EXCLUDED.baseline_exercise,
+            current_sleep = EXCLUDED.current_sleep,
+            current_stress = EXCLUDED.current_stress,
+            current_exercise = EXCLUDED.current_exercise,
+            score = EXCLUDED.score,
+            alert_level = EXCLUDED.alert_level
+    `, [
         userId, date,
-        baseline.avg_sleep, baseline.avg_stress, baseline.avg_exercise,
-        current.avg_sleep || 0, current.avg_stress || 0, current.avg_exercise || 0,
+        bSleep, bStress, bExercise,
+        cSleep, cStress, cExercise,
         score, alertLevel
-    );
+    ]);
 
     return {
         score,
         alert_level: alertLevel,
         interpretation: getAlertInterpretation(score),
-        baseline: { sleep: baseline.avg_sleep, stress: baseline.avg_stress },
-        current: { sleep: current.avg_sleep, stress: current.avg_stress }
+        baseline: { sleep: bSleep, stress: bStress },
+        current: { sleep: cSleep, stress: cStress }
     };
 }
 
@@ -473,7 +503,6 @@ function getRecoveryRecommendations(score, warnings) {
         recs.push('Consider helping a friend who might be struggling.');
     }
 
-    // Add specific recommendations based on warnings
     const hasNoSleep = warnings.some(w => w.type === 'sleep');
     const hasNoExercise = warnings.some(w => w.type === 'exercise');
 

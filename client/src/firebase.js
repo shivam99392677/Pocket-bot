@@ -15,15 +15,14 @@ import {
     signInWithPopup
 } from 'firebase/auth';
 
-// ⚠️ REPLACE THESE with your actual Firebase project credentials
 const firebaseConfig = {
-    apiKey: "AIzaSyAxJJgI_f1C3m9r0rMEUUigptA9hIqwNkk",
-    authDomain: "pocketbuddy-f580d.firebaseapp.com",
-    projectId: "pocketbuddy-f580d",
-    storageBucket: "pocketbuddy-f580d.firebasestorage.app",
-    messagingSenderId: "472300580815",
-    appId: "1:472300580815:web:45f2c51151aed573caacba",
-    measurementId: "G-CVSVCMZC8E"
+    apiKey: process.env.REACT_APP_FIREBASE_API_KEY || "AIzaSyAxJJgI_f1C3m9r0rMEUUigptA9hIqwNkk",
+    authDomain: process.env.REACT_APP_FIREBASE_AUTH_DOMAIN || "pocketbuddy-f580d.firebaseapp.com",
+    projectId: process.env.REACT_APP_FIREBASE_PROJECT_ID || "pocketbuddy-f580d",
+    storageBucket: process.env.REACT_APP_FIREBASE_STORAGE_BUCKET || "pocketbuddy-f580d.firebasestorage.app",
+    messagingSenderId: process.env.REACT_APP_FIREBASE_MESSAGING_SENDER_ID || "472300580815",
+    appId: process.env.REACT_APP_FIREBASE_APP_ID || "1:472300580815:web:45f2c51151aed573caacba",
+    measurementId: process.env.REACT_APP_FIREBASE_MEASUREMENT_ID || "G-CVSVCMZC8E"
 };
 
 // Initialize Firebase

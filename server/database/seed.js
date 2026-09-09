@@ -1,10 +1,10 @@
 // ============================================================
-// SEED DATA - Populates budget_meals with 50+ meal options
+// SEED DATA - Populates budget_meals with 50+ meal options for PostgreSQL
 // ============================================================
 
-function seedBudgetMeals(db) {
-    // Clear the table first to update all seed values to INR and prevent duplication
-    db.prepare('DELETE FROM budget_meals').run();
+async function seedBudgetMeals(pool) {
+    // Clear table first to prevent duplicate seed values
+    await pool.query('TRUNCATE TABLE budget_meals RESTART IDENTITY');
 
     const meals = [
         // --- BREAKFAST (under ₹200) ---
@@ -55,19 +55,25 @@ function seedBudgetMeals(db) {
         { name: 'Fruit Salad', cost: 150.00, calories: 150, category: 'snack', prep_time_minutes: 5, is_vegetarian: 1, is_vegan: 1, instructions: 'Chop seasonal fruits, mix together' },
     ];
 
-    const insert = db.prepare(`
-    INSERT INTO budget_meals (name, cost, calories, category, prep_time_minutes, is_vegetarian, is_vegan, instructions)
-    VALUES (@name, @cost, @calories, @category, @prep_time_minutes, @is_vegetarian, @is_vegan, @instructions)
-  `);
+    const insertText = `
+        INSERT INTO budget_meals (name, cost, calories, category, prep_time_minutes, is_vegetarian, is_vegan, instructions)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `;
 
-    const insertMany = db.transaction((meals) => {
-        for (const meal of meals) {
-            insert.run(meal);
-        }
-    });
+    for (const meal of meals) {
+        await pool.query(insertText, [
+            meal.name,
+            meal.cost,
+            meal.calories,
+            meal.category,
+            meal.prep_time_minutes,
+            meal.is_vegetarian,
+            meal.is_vegan,
+            meal.instructions
+        ]);
+    }
 
-    insertMany(meals);
-    console.log(`✓ Seeded ${meals.length} budget meals with INR values`);
+    console.log(`✓ Seeded ${meals.length} budget meals into PostgreSQL`);
 }
 
 module.exports = { seedBudgetMeals };

@@ -1,12 +1,13 @@
 // ============================================================
-// POCKETBUDDY SERVER - MVP Mode
-// Firebase auth handled client-side, no service account needed
+// POCKETBUDDY SERVER - PostgreSQL Edition
+// Firebase auth handled client-side, PostgreSQL database backend
 // ============================================================
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
 
+const db = require('./database/db');
 const { initializeDatabase } = require('./database/setup');
 const { seedBudgetMeals } = require('./database/seed');
 const { createAuthMiddleware } = require('./middleware/auth');
@@ -14,12 +15,7 @@ const { createAuthMiddleware } = require('./middleware/auth');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// ---- Database ----
-const dbPath = path.resolve(process.env.DB_PATH || './database/pocketbuddy.db');
-const db = initializeDatabase(dbPath);
-seedBudgetMeals(db);
-
-// Auth middleware (decodes Firebase tokens + our JWT)
+// Auth middleware (decodes Firebase tokens + our JWT via PostgreSQL)
 const authenticateToken = createAuthMiddleware(db);
 
 // ---- Middleware ----
@@ -40,8 +36,9 @@ app.use('/api/support', require('./routes/support')(db, authenticateToken));
 // ---- Proxy /api/v1 requests to Python FastAPI backend ----
 app.all('/api/v1/*', authenticateToken, async (req, res) => {
     try {
-        const path = req.originalUrl;
-        const pythonUrl = `http://localhost:8000${path}`;
+        const reqPath = req.originalUrl;
+        const pythonBaseUrl = process.env.PYTHON_BACKEND_URL || 'http://localhost:8000';
+        const pythonUrl = `${pythonBaseUrl}${reqPath}`;
         const options = {
             method: req.method,
             headers: {
@@ -69,16 +66,32 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 // ---- Health check ----
-app.get('/api/health-check', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+app.get('/api/health-check', async (req, res) => {
+    try {
+        await db.query('SELECT 1');
+        res.json({ status: 'ok', db: 'postgresql', timestamp: new Date().toISOString() });
+    } catch (err) {
+        res.status(500).json({ status: 'error', db: 'postgresql_failed', error: err.message });
+    }
 });
 
-// ---- Start ----
-app.listen(PORT, () => {
-    console.log(`\n🚀 PocketBuddy running → http://localhost:${PORT}`);
-    console.log(`📊 DB: ${dbPath}`);
-    console.log(`🔐 Auth: Firebase (client-side) + JWT fallback`);
-    console.log(`   No service account needed for MVP\n`);
-});
+// ---- Startup & Database Initialization ----
+async function startServer() {
+    try {
+        await initializeDatabase(db);
+        await seedBudgetMeals(db);
+        console.log('✅ PostgreSQL Database schema initialized and seeded');
+
+        app.listen(PORT, '0.0.0.0', () => {
+            console.log(`\n🚀 PocketBuddy running → http://localhost:${PORT}`);
+            console.log(`📊 DB: PostgreSQL (${process.env.DATABASE_URL ? 'DATABASE_URL' : process.env.PGHOST || 'localhost'})`);
+            console.log(`🔐 Auth: Firebase (client-side) + JWT fallback\n`);
+        });
+    } catch (err) {
+        console.error('Failed to initialize PostgreSQL database / start server:', err);
+    }
+}
+
+startServer();
 
 module.exports = app;

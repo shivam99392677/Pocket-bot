@@ -35,7 +35,7 @@ class BurnoutPredictor:
     Thread-safe for concurrent web requests (stateless per call).
     """
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str = None):
         self._db_path = db_path
         self._fe = FeatureEngineer(db_path)
         self._combiner = ScoreCombiner()

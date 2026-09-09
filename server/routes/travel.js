@@ -1,5 +1,5 @@
 // ============================================================
-// FEATURE 3: TRAVEL OPTIONS
+// FEATURE 3: TRAVEL OPTIONS - PostgreSQL Edition
 // Track trips, find patterns, suggest cheaper alternatives
 // ============================================================
 const express = require('express');
@@ -20,7 +20,7 @@ const TRANSPORT_COSTS = {
 module.exports = function (db, authenticateToken) {
 
     // POST /api/travel/log - Log a trip
-    router.post('/log', authenticateToken, (req, res) => {
+    router.post('/log', authenticateToken, async (req, res) => {
         try {
             const { origin, destination, mode, cost, duration_minutes, date } = req.body;
 
@@ -37,14 +37,15 @@ module.exports = function (db, authenticateToken) {
 
             const tripDate = date || new Date().toISOString().split('T')[0];
 
-            const result = db.prepare(`
-        INSERT INTO travel_logs (user_id, date, origin, destination, mode, cost, duration_minutes)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(req.user.id, tripDate, origin, destination, mode.toLowerCase(), cost || 0, duration_minutes || 0);
+            const result = await db.query(`
+                INSERT INTO travel_logs (user_id, date, origin, destination, mode, cost, duration_minutes)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id
+            `, [req.user.id, tripDate, origin, destination, mode.toLowerCase(), cost || 0, duration_minutes || 0]);
 
             res.status(201).json({
                 message: 'Trip logged!',
-                trip: { id: result.lastInsertRowid, origin, destination, mode, cost, date: tripDate }
+                trip: { id: result.rows[0].id, origin, destination, mode, cost, date: tripDate }
             });
         } catch (err) {
             console.error('Log travel error:', err);
@@ -53,18 +54,27 @@ module.exports = function (db, authenticateToken) {
     });
 
     // GET /api/travel/options - Get alternative transport options for common routes
-    router.get('/options', authenticateToken, (req, res) => {
+    router.get('/options', authenticateToken, async (req, res) => {
         try {
             // Find user's most common routes
-            const commonRoutes = db.prepare(`
-        SELECT origin, destination, mode, AVG(cost) as avg_cost, COUNT(*) as trip_count,
-               AVG(duration_minutes) as avg_duration
-        FROM travel_logs
-        WHERE user_id = ? AND date >= date('now', '-30 days')
-        GROUP BY origin, destination
-        ORDER BY trip_count DESC
-        LIMIT 5
-      `).all(req.user.id);
+            const commonRoutesRes = await db.query(`
+                SELECT origin, destination, mode, AVG(cost) as avg_cost, COUNT(*) as trip_count,
+                       AVG(duration_minutes) as avg_duration
+                FROM travel_logs
+                WHERE user_id = $1 AND date::date >= (CURRENT_DATE - INTERVAL '30 days')
+                GROUP BY origin, destination, mode
+                ORDER BY trip_count DESC
+                LIMIT 5
+            `, [req.user.id]);
+
+            const commonRoutes = commonRoutesRes.rows.map(r => ({
+                origin: r.origin,
+                destination: r.destination,
+                mode: r.mode,
+                avg_cost: parseFloat(r.avg_cost),
+                trip_count: parseInt(r.trip_count, 10),
+                avg_duration: parseFloat(r.avg_duration)
+            }));
 
             // For each common route, suggest alternatives
             const routeOptions = commonRoutes.map(route => {
@@ -118,23 +128,35 @@ module.exports = function (db, authenticateToken) {
     });
 
     // GET /api/travel/savings - Show total savings potential
-    router.get('/savings', authenticateToken, (req, res) => {
+    router.get('/savings', authenticateToken, async (req, res) => {
         try {
             // Total travel spending last 30 days
-            const totalSpend = db.prepare(`
-        SELECT COALESCE(SUM(cost), 0) as total, COUNT(*) as trips
-        FROM travel_logs
-        WHERE user_id = ? AND date >= date('now', '-30 days')
-      `).get(req.user.id);
+            const totalSpendRes = await db.query(`
+                SELECT COALESCE(SUM(cost), 0) as total, COUNT(*) as trips
+                FROM travel_logs
+                WHERE user_id = $1 AND date::date >= (CURRENT_DATE - INTERVAL '30 days')
+            `, [req.user.id]);
+
+            const totalSpend = {
+                total: parseFloat(totalSpendRes.rows[0].total) || 0,
+                trips: parseInt(totalSpendRes.rows[0].trips, 10) || 0
+            };
 
             // Spending by mode
-            const byMode = db.prepare(`
-        SELECT mode, SUM(cost) as total, COUNT(*) as trips, AVG(cost) as avg_cost
-        FROM travel_logs
-        WHERE user_id = ? AND date >= date('now', '-30 days')
-        GROUP BY mode
-        ORDER BY total DESC
-      `).all(req.user.id);
+            const byModeRes = await db.query(`
+                SELECT mode, SUM(cost) as total, COUNT(*) as trips, AVG(cost) as avg_cost
+                FROM travel_logs
+                WHERE user_id = $1 AND date::date >= (CURRENT_DATE - INTERVAL '30 days')
+                GROUP BY mode
+                ORDER BY total DESC
+            `, [req.user.id]);
+
+            const byMode = byModeRes.rows.map(r => ({
+                mode: r.mode,
+                total: parseFloat(r.total),
+                trips: parseInt(r.trips, 10),
+                avg_cost: parseFloat(r.avg_cost)
+            }));
 
             // Calculate potential savings if switching expensive modes to cheaper ones
             let potentialSavings = 0;
@@ -162,7 +184,6 @@ module.exports = function (db, authenticateToken) {
             const busTrips = byMode.find(m => m.mode === 'bus');
             let passRecommendation = null;
             if (busTrips && busTrips.trips >= 16) {
-                // 16+ bus trips/month = monthly pass is worth it
                 const passCost = TRANSPORT_COSTS.bus.monthly_pass;
                 const withoutPass = busTrips.total;
                 if (withoutPass > passCost) {
@@ -188,48 +209,69 @@ module.exports = function (db, authenticateToken) {
     });
 
     // GET /api/travel/patterns - Identify regular travel patterns
-    router.get('/patterns', authenticateToken, (req, res) => {
+    router.get('/patterns', authenticateToken, async (req, res) => {
         try {
             // Most visited destinations
-            const topDestinations = db.prepare(`
-        SELECT destination, COUNT(*) as visits, AVG(cost) as avg_cost
-        FROM travel_logs
-        WHERE user_id = ? AND date >= date('now', '-30 days')
-        GROUP BY destination
-        ORDER BY visits DESC
-        LIMIT 5
-      `).all(req.user.id);
+            const topDestinationsRes = await db.query(`
+                SELECT destination, COUNT(*) as visits, AVG(cost) as avg_cost
+                FROM travel_logs
+                WHERE user_id = $1 AND date::date >= (CURRENT_DATE - INTERVAL '30 days')
+                GROUP BY destination
+                ORDER BY visits DESC
+                LIMIT 5
+            `, [req.user.id]);
+
+            const topDestinations = topDestinationsRes.rows.map(r => ({
+                destination: r.destination,
+                visits: parseInt(r.visits, 10),
+                avg_cost: parseFloat(r.avg_cost)
+            }));
 
             // Travel by day of week
-            const byDayOfWeek = db.prepare(`
-        SELECT
-          CASE strftime('%w', date)
-            WHEN '0' THEN 'Sunday'
-            WHEN '1' THEN 'Monday'
-            WHEN '2' THEN 'Tuesday'
-            WHEN '3' THEN 'Wednesday'
-            WHEN '4' THEN 'Thursday'
-            WHEN '5' THEN 'Friday'
-            WHEN '6' THEN 'Saturday'
-          END as day_name,
-          COUNT(*) as trips,
-          SUM(cost) as total_cost
-        FROM travel_logs
-        WHERE user_id = ? AND date >= date('now', '-30 days')
-        GROUP BY strftime('%w', date)
-        ORDER BY strftime('%w', date)
-      `).all(req.user.id);
+            const byDayOfWeekRes = await db.query(`
+                SELECT
+                    CASE EXTRACT(DOW FROM date::date)
+                        WHEN 0 THEN 'Sunday'
+                        WHEN 1 THEN 'Monday'
+                        WHEN 2 THEN 'Tuesday'
+                        WHEN 3 THEN 'Wednesday'
+                        WHEN 4 THEN 'Thursday'
+                        WHEN 5 THEN 'Friday'
+                        WHEN 6 THEN 'Saturday'
+                    END as day_name,
+                    COUNT(*) as trips,
+                    SUM(cost) as total_cost
+                FROM travel_logs
+                WHERE user_id = $1 AND date::date >= (CURRENT_DATE - INTERVAL '30 days')
+                GROUP BY EXTRACT(DOW FROM date::date)
+                ORDER BY EXTRACT(DOW FROM date::date)
+            `, [req.user.id]);
 
-            // Regular routes (same origin-destination, 3+ times)
-            const regularRoutes = db.prepare(`
-        SELECT origin, destination, mode, COUNT(*) as frequency,
-               AVG(cost) as avg_cost, SUM(cost) as total_cost
-        FROM travel_logs
-        WHERE user_id = ? AND date >= date('now', '-30 days')
-        GROUP BY origin, destination
-        HAVING COUNT(*) >= 2
-        ORDER BY frequency DESC
-      `).all(req.user.id);
+            const byDayOfWeek = byDayOfWeekRes.rows.map(r => ({
+                day_name: r.day_name,
+                trips: parseInt(r.trips, 10),
+                total_cost: parseFloat(r.total_cost)
+            }));
+
+            // Regular routes (same origin-destination, 2+ times)
+            const regularRoutesRes = await db.query(`
+                SELECT origin, destination, mode, COUNT(*) as frequency,
+                       AVG(cost) as avg_cost, SUM(cost) as total_cost
+                FROM travel_logs
+                WHERE user_id = $1 AND date::date >= (CURRENT_DATE - INTERVAL '30 days')
+                GROUP BY origin, destination, mode
+                HAVING COUNT(*) >= 2
+                ORDER BY frequency DESC
+            `, [req.user.id]);
+
+            const regularRoutes = regularRoutesRes.rows.map(r => ({
+                origin: r.origin,
+                destination: r.destination,
+                mode: r.mode,
+                frequency: parseInt(r.frequency, 10),
+                avg_cost: parseFloat(r.avg_cost),
+                total_cost: parseFloat(r.total_cost)
+            }));
 
             res.json({
                 top_destinations: topDestinations,

@@ -1,7 +1,6 @@
 // ============================================================
-// FEATURE 6: PERSONALIZED SUPPORT
+// FEATURE 6: PERSONALIZED SUPPORT - PostgreSQL Edition
 // AI chat, cross-feature insights, personalized advice
-// Uses simple rule-based system (no complex ML needed)
 // ============================================================
 const express = require('express');
 const router = express.Router();
@@ -18,7 +17,7 @@ module.exports = function (db, authenticateToken) {
             }
 
             // Gather all user context for personalized response
-            const context = gatherUserContext(db, req.user.id);
+            const context = await gatherUserContext(db, req.user.id);
 
             // Enrich with Python Wellness & Burnout dashboard context
             let pythonDashboard = null;
@@ -84,10 +83,10 @@ module.exports = function (db, authenticateToken) {
 
             // Save to chat history
             const date = new Date().toISOString().split('T')[0];
-            db.prepare(`
-        INSERT INTO chat_history (user_id, date, user_message, ai_response, context)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(req.user.id, date, message, aiResponse, JSON.stringify(context.summary));
+            await db.query(`
+                INSERT INTO chat_history (user_id, date, user_message, ai_response, context)
+                VALUES ($1, $2, $3, $4, $5)
+            `, [req.user.id, date, message, aiResponse, JSON.stringify(context.summary)]);
 
             res.json({
                 response: aiResponse,
@@ -137,19 +136,19 @@ module.exports = function (db, authenticateToken) {
     });
 
     // GET /api/support/suggestions - Get personalized tips based on all data
-    router.get('/suggestions', authenticateToken, (req, res) => {
+    router.get('/suggestions', authenticateToken, async (req, res) => {
         try {
-            const context = gatherUserContext(db, req.user.id);
+            const context = await gatherUserContext(db, req.user.id);
             const suggestions = generatePersonalizedSuggestions(context);
 
             // Store as recommendations
             const date = new Date().toISOString().split('T')[0];
-            suggestions.forEach(s => {
-                db.prepare(`
-          INSERT INTO recommendations (user_id, date, type, text)
-          VALUES (?, ?, ?, ?)
-        `).run(req.user.id, date, s.type, s.text);
-            });
+            for (const s of suggestions) {
+                await db.query(`
+                    INSERT INTO recommendations (user_id, date, type, text)
+                    VALUES ($1, $2, $3, $4)
+                `, [req.user.id, date, s.type, s.text]);
+            }
 
             res.json({
                 suggestions,
@@ -176,7 +175,7 @@ module.exports = function (db, authenticateToken) {
     });
 
     // POST /api/support/feedback - Rate helpfulness of advice
-    router.post('/feedback', authenticateToken, (req, res) => {
+    router.post('/feedback', authenticateToken, async (req, res) => {
         try {
             const { recommendation_id, was_helpful, feedback } = req.body;
 
@@ -184,11 +183,11 @@ module.exports = function (db, authenticateToken) {
                 return res.status(400).json({ error: 'recommendation_id and was_helpful are required.' });
             }
 
-            db.prepare(`
-        UPDATE recommendations
-        SET was_helpful = ?, feedback = ?
-        WHERE id = ? AND user_id = ?
-      `).run(was_helpful ? 1 : 0, feedback || '', recommendation_id, req.user.id);
+            await db.query(`
+                UPDATE recommendations
+                SET was_helpful = $1, feedback = $2
+                WHERE id = $3 AND user_id = $4
+            `, [was_helpful ? 1 : 0, feedback || '', recommendation_id, req.user.id]);
 
             res.json({ message: 'Thanks for the feedback! This helps us give better advice.' });
         } catch (err) {
@@ -198,37 +197,38 @@ module.exports = function (db, authenticateToken) {
     });
 
     // GET /api/chat/history - Get chat history
-    router.get('/chat/history', authenticateToken, (req, res) => {
+    router.get('/chat/history', authenticateToken, async (req, res) => {
         try {
             const { limit } = req.query;
-            const messages = db.prepare(`
-        SELECT id, date, user_message, ai_response, created_at
-        FROM chat_history
-        WHERE user_id = ?
-        ORDER BY created_at DESC
-        LIMIT ?
-      `).all(req.user.id, parseInt(limit) || 20);
+            const messagesRes = await db.query(`
+                SELECT id, date, user_message, ai_response, created_at
+                FROM chat_history
+                WHERE user_id = $1
+                ORDER BY created_at DESC
+                LIMIT $2
+            `, [req.user.id, parseInt(limit, 10) || 20]);
 
-            res.json(messages.reverse()); // Return in chronological order
+            res.json(messagesRes.rows.reverse()); // Return in chronological order
         } catch (err) {
             console.error('Chat history error:', err);
             res.status(500).json({ error: 'Failed to get chat history.' });
         }
     });
 
-    const { generateRecommendation, generatePurchaseAdvice, generateChatResponse } = require('../gemini');
+    const { generateRecommendation, generatePurchaseAdvice } = require('../gemini');
 
     // GET /api/support/recommendation - Generate AI wellness & finance recommendation
     router.get('/recommendation', authenticateToken, async (req, res) => {
         try {
-            const context = gatherUserContext(db, req.user.id);
-            
+            const context = await gatherUserContext(db, req.user.id);
+
             // Extract parameters for prompt
             const latestHealth = context.health || { sleep_hours: 8, stress_level: 1, mood: 'neutral' };
-            const totalSpent = context.expenses.reduce((sum, e) => sum + e.total, 0);
-            const foodExpense = context.expenses.find(e => e.category === 'food')?.total || 0;
+            const totalSpent = (context.expenses || []).reduce((sum, e) => sum + (parseFloat(e.total) || 0), 0);
+            const foodExpenseObj = (context.expenses || []).find(e => e.category === 'food');
+            const foodExpense = foodExpenseObj ? parseFloat(foodExpenseObj.total) || 0 : 0;
             const foodPercent = totalSpent > 0 ? (foodExpense / totalSpent) * 100 : 0;
-            
+
             const aiData = {
                 sleep_hours: latestHealth.sleep_hours,
                 stress_level: latestHealth.stress_level,
@@ -237,16 +237,16 @@ module.exports = function (db, authenticateToken) {
                 total_spent: totalSpent,
                 food_percent: foodPercent
             };
-            
+
             const rec = await generateRecommendation(aiData);
-            
+
             // Save to DB
             const date = new Date().toISOString().split('T')[0];
-            db.prepare(`
+            await db.query(`
                 INSERT INTO recommendations (user_id, date, type, text)
-                VALUES (?, ?, ?, ?)
-            `).run(req.user.id, date, rec.type, rec.message);
-            
+                VALUES ($1, $2, $3, $4)
+            `, [req.user.id, date, rec.type, rec.message]);
+
             res.json({
                 type: rec.type,
                 message: rec.message,
@@ -265,31 +265,32 @@ module.exports = function (db, authenticateToken) {
             if (!name || cost === undefined) {
                 return res.status(400).json({ error: 'Item name and cost are required.' });
             }
-            
-            const context = gatherUserContext(db, req.user.id);
-            
+
+            const context = await gatherUserContext(db, req.user.id);
+
             // Financial analytics
-            const monthlyPocketMoney = context.user?.monthly_income || 0;
-            const totalExpenses = db.prepare(`
-                SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE user_id = ?
-            `).get(req.user.id).total;
-            
+            const monthlyPocketMoney = parseFloat(context.user?.monthly_income) || 0;
+            const totalExpensesRes = await db.query(`
+                SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE user_id = $1
+            `, [req.user.id]);
+            const totalExpenses = parseFloat(totalExpensesRes.rows[0].total) || 0;
+
             const remainingBalance = monthlyPocketMoney - totalExpenses;
-            
+
             // Calculate safe daily spending
             const today = new Date();
             const lastDay = new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate();
             const remainingDays = Math.max(1, lastDay - today.getDate());
             const safeDailySpending = remainingBalance > 0 ? (remainingBalance / remainingDays) : 0;
-            
+
             const aiContext = {
                 remaining_balance: remainingBalance,
                 safe_daily_spending: safeDailySpending,
                 total_spent: totalExpenses
             };
-            
+
             const advice = await generatePurchaseAdvice(aiContext, name, parseFloat(cost));
-            
+
             res.json({
                 affordable: advice.affordable,
                 message: advice.message,
@@ -306,41 +307,53 @@ module.exports = function (db, authenticateToken) {
 };
 
 // ============================================================
-// HELPER: Gather all context about a user
+// HELPER: Gather all context about a user (PostgreSQL Edition)
 // ============================================================
-function gatherUserContext(db, userId) {
+async function gatherUserContext(db, userId) {
     // User profile
-    const user = db.prepare('SELECT name, major, year, monthly_income, daily_budget FROM users WHERE id = ?').get(userId);
+    const userRes = await db.query('SELECT name, major, year, monthly_income, daily_budget FROM users WHERE id = $1', [userId]);
+    const user = userRes.rows[0] || null;
 
     // Recent burnout score
-    const burnout = db.prepare('SELECT score, alert_level FROM burnout_scores WHERE user_id = ? ORDER BY date DESC LIMIT 1').get(userId);
+    const burnoutRes = await db.query('SELECT score, alert_level FROM burnout_scores WHERE user_id = $1 ORDER BY date DESC LIMIT 1', [userId]);
+    const burnout = burnoutRes.rows[0] || null;
 
     // Recent health
-    const health = db.prepare('SELECT * FROM health_logs WHERE user_id = ? ORDER BY date DESC LIMIT 7').all(userId);
+    const healthRes = await db.query('SELECT * FROM health_logs WHERE user_id = $1 ORDER BY date DESC LIMIT 7', [userId]);
+    const health = healthRes.rows.map(h => ({
+        ...h,
+        sleep_hours: parseFloat(h.sleep_hours),
+        stress_level: parseInt(h.stress_level, 10),
+        study_hours: parseFloat(h.study_hours),
+        exercise_minutes: parseInt(h.exercise_minutes, 10)
+    }));
 
     // Expense patterns (last 7 days)
-    const expenses = db.prepare(`
-    SELECT category, SUM(amount) as total
-    FROM expenses WHERE user_id = ? AND date >= date('now', '-7 days')
-    GROUP BY category
-  `).all(userId);
+    const expensesRes = await db.query(`
+        SELECT category, SUM(amount) as total
+        FROM expenses WHERE user_id = $1 AND date::date >= (CURRENT_DATE - INTERVAL '7 days')
+        GROUP BY category
+    `, [userId]);
+    const expenses = expensesRes.rows.map(r => ({ category: r.category, total: parseFloat(r.total) }));
 
     // Food spending
-    const foodSpend = db.prepare(`
-    SELECT COALESCE(AVG(daily_total), 0) as avg_daily
-    FROM (
-      SELECT SUM(cost) as daily_total FROM food_logs
-      WHERE user_id = ? AND date >= date('now', '-7 days')
-      GROUP BY date
-    )
-  `).get(userId);
+    const foodSpendRes = await db.query(`
+        SELECT COALESCE(AVG(daily_total), 0) as avg_daily
+        FROM (
+            SELECT SUM(cost) as daily_total FROM food_logs
+            WHERE user_id = $1 AND date::date >= (CURRENT_DATE - INTERVAL '7 days')
+            GROUP BY date
+        ) sub
+    `, [userId]);
+    const foodSpend = parseFloat(foodSpendRes.rows[0]?.avg_daily) || 0;
 
     // Past recommendations that worked
-    const whatWorked = db.prepare(`
-    SELECT type, text FROM recommendations
-    WHERE user_id = ? AND was_helpful = 1
-    ORDER BY date DESC LIMIT 5
-  `).all(userId);
+    const whatWorkedRes = await db.query(`
+        SELECT type, text FROM recommendations
+        WHERE user_id = $1 AND was_helpful = 1
+        ORDER BY date DESC LIMIT 5
+    `, [userId]);
+    const whatWorked = whatWorkedRes.rows;
 
     // Exercise stats
     const exerciseStats = health.length > 0
@@ -362,7 +375,7 @@ function gatherUserContext(db, userId) {
         burnout: burnout || { score: 0, alert_level: 'unknown' },
         health: health[0] || null,
         expenses,
-        foodSpend: foodSpend.avg_daily,
+        foodSpend,
         whatWorked,
         exercise: exerciseStats,
         sleep: sleepStats,
@@ -372,20 +385,17 @@ function gatherUserContext(db, userId) {
             avg_sleep: sleepStats.avg,
             avg_stress: stressStats.avg,
             avg_exercise: exerciseStats.avg,
-            daily_food_spend: foodSpend.avg_daily
+            daily_food_spend: foodSpend
         }
     };
 }
 
 // ============================================================
 // RULE-BASED AI RESPONSE GENERATOR
-// No complex ML - just smart rules based on user data
 // ============================================================
 function generateResponse(message, context) {
     const msg = message.toLowerCase();
     const { burnout, sleep, stress, exercise, foodSpend, whatWorked, user } = context;
-
-    // ---- Topic Detection ----
 
     // Stress / burnout related
     if (msg.includes('stress') || msg.includes('burnout') || msg.includes('overwhelm') || msg.includes('anxious')) {
@@ -419,12 +429,12 @@ function generateResponse(message, context) {
 
     // Money / budget related
     if (msg.includes('money') || msg.includes('budget') || msg.includes('spend') || msg.includes('expensive') || msg.includes('broke')) {
-        const totalExpenses = context.expenses.reduce((s, e) => s + e.total, 0);
+        const totalExpenses = (context.expenses || []).reduce((s, e) => s + (e.total || 0), 0);
         const dailySpend = totalExpenses / 7;
 
         let response = `Looking at your spending: you've spent ₹${totalExpenses.toFixed(2)} in the last 7 days (₹${dailySpend.toFixed(2)}/day). `;
 
-        if (user.daily_budget > 0 && dailySpend > user.daily_budget) {
+        if (user?.daily_budget > 0 && dailySpend > user.daily_budget) {
             response += `That's above your ₹${user.daily_budget}/day budget. `;
         }
 
@@ -451,7 +461,7 @@ function generateResponse(message, context) {
     // Exercise related
     if (msg.includes('exercise') || msg.includes('workout') || msg.includes('gym') || msg.includes('walk') || msg.includes('active')) {
         if (exercise.avg < 10) {
-            const pastExerciseHelped = whatWorked.some(w => w.type === 'exercise' || w.text.includes('walk') || w.text.includes('exercise'));
+            const pastExerciseHelped = (whatWorked || []).some(w => w.type === 'exercise' || w.text.includes('walk') || w.text.includes('exercise'));
             let response = `I see you're not exercising much (avg ${exercise.avg.toFixed(0)} min/day). `;
 
             if (pastExerciseHelped) {
@@ -495,12 +505,12 @@ function generateResponse(message, context) {
 
     // General greeting or unclear intent
     if (msg.includes('hello') || msg.includes('hi') || msg.includes('hey') || msg.length < 10) {
-        return `Hey ${user.name}! How's your day going? ` +
+        return `Hey ${user?.name || 'there'}! How's your day going? ` +
             `I can help with budgeting, food ideas, stress management, study tips, or just chat. What's on your mind?`;
     }
 
     // Default: provide general personalized insight
-    let defaultResponse = `Thanks for sharing, ${user.name}. Based on what I know about you: `;
+    let defaultResponse = `Thanks for sharing, ${user?.name || 'friend'}. Based on what I know about you: `;
 
     if (burnout.score >= 4) {
         defaultResponse += `your stress levels are elevated, so prioritize rest. `;
@@ -517,9 +527,6 @@ function generateResponse(message, context) {
     return defaultResponse;
 }
 
-// ============================================================
-// Generate quick-reply suggestions based on context
-// ============================================================
 function getSuggestions(context) {
     const suggestions = [];
 
@@ -536,20 +543,15 @@ function getSuggestions(context) {
         suggestions.push('How do I start exercising?');
     }
 
-    // Always offer these
     suggestions.push('What should I focus on today?');
 
     return suggestions.slice(0, 4);
 }
 
-// ============================================================
-// Generate personalized suggestions from ALL user data
-// ============================================================
 function generatePersonalizedSuggestions(context) {
     const suggestions = [];
     const { burnout, sleep, stress, exercise, foodSpend, whatWorked } = context;
 
-    // High burnout + no exercise
     if (burnout.score >= 7 && exercise.days_zero >= 3) {
         suggestions.push({
             type: 'exercise',
@@ -558,7 +560,6 @@ function generatePersonalizedSuggestions(context) {
         });
     }
 
-    // Overspending on food + high stress (stress eating?)
     if (foodSpend > 500 && stress.avg >= 6) {
         suggestions.push({
             type: 'food',
@@ -567,7 +568,6 @@ function generatePersonalizedSuggestions(context) {
         });
     }
 
-    // Poor sleep + too much studying
     if (sleep.avg < 6 && context.health && context.health.study_hours > 6) {
         suggestions.push({
             type: 'sleep',
@@ -576,8 +576,7 @@ function generatePersonalizedSuggestions(context) {
         });
     }
 
-    // Past recommendation that worked
-    if (whatWorked.length > 0) {
+    if (whatWorked && whatWorked.length > 0) {
         const past = whatWorked[0];
         suggestions.push({
             type: 'reminder',
@@ -586,7 +585,6 @@ function generatePersonalizedSuggestions(context) {
         });
     }
 
-    // Low exercise
     if (exercise.avg < 10 && burnout.score < 7) {
         suggestions.push({
             type: 'exercise',
@@ -595,7 +593,6 @@ function generatePersonalizedSuggestions(context) {
         });
     }
 
-    // Good habits - reinforce
     if (burnout.score <= 3 && sleep.avg >= 7) {
         suggestions.push({
             type: 'motivation',
