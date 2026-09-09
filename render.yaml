@@ -1,6 +1,6 @@
 # ============================================================
 # Render Blueprint Specification for PocketBuddy Monorepo
-# Includes PostgreSQL, Express API, FastAPI ML Service & React Client
+# Uses external PostgreSQL (Supabase), Express API, FastAPI ML Service & React Client
 # ============================================================
 
 services:
@@ -15,9 +15,7 @@ services:
     healthCheckPath: /health
     envVars:
       - key: DATABASE_URL
-        fromDatabase:
-          name: pocketbuddy-db
-          property: connectionString
+        sync: false
       - key: PYTHONPATH
         value: backend/src
       - key: GROQ_API_KEY
@@ -36,11 +34,12 @@ services:
     healthCheckPath: /api/health-check
     envVars:
       - key: DATABASE_URL
-        fromDatabase:
-          name: pocketbuddy-db
-          property: connectionString
+        sync: false
       - key: PYTHON_BACKEND_URL
-        value: http://pocketbuddy-fastapi:8000
+        fromService:
+          type: web
+          name: pocketbuddy-fastapi
+          property: hostport
       - key: JWT_SECRET
         sync: false
       - key: NODE_ENV
@@ -61,12 +60,3 @@ services:
     envVars:
       - key: REACT_APP_API_URL
         sync: false
-
-databases:
-  # ------------------------------------------------------------
-  # Managed PostgreSQL Database
-  # ------------------------------------------------------------
-  - name: pocketbuddy-db
-    databaseName: pocketbuddy
-    user: pocketbuddy_user
-    plan: free

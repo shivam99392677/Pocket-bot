@@ -25,14 +25,7 @@ def get_connection_config() -> dict:
     """Parse connection configuration from DATABASE_URL or individual PG* env vars."""
     database_url = os.getenv("DATABASE_URL")
     if database_url:
-        parsed = urlparse(database_url)
-        return {
-            "dbname": parsed.path.lstrip("/"),
-            "user": parsed.username,
-            "password": parsed.password,
-            "host": parsed.hostname or "localhost",
-            "port": parsed.port or 5432,
-        }
+        return {"dsn": database_url}
 
     return {
         "dbname": os.getenv("PGDATABASE", "pocketbuddy"),
@@ -50,7 +43,7 @@ class PostgresDB:
     def get_pool(cls) -> ThreadedConnectionPool:
         if cls._pool is None or cls._pool.closed:
             config = get_connection_config()
-            log.info(f"Initializing PostgreSQL pool for database: {config['dbname']} on {config['host']}:{config['port']}")
+            log.info("Initializing PostgreSQL pool...")
             cls._pool = ThreadedConnectionPool(
                 minconn=1,
                 maxconn=10,

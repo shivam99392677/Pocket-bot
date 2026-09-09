@@ -38,7 +38,10 @@ app.all('/api/v1/*', authenticateToken, async (req, res) => {
     try {
         const reqPath = req.originalUrl;
         const pythonBaseUrl = process.env.PYTHON_BACKEND_URL || 'http://localhost:8000';
-        const pythonUrl = `${pythonBaseUrl}${reqPath}`;
+        const targetBase = (pythonBaseUrl.startsWith('http://') || pythonBaseUrl.startsWith('https://'))
+            ? pythonBaseUrl
+            : `http://${pythonBaseUrl}`;
+        const pythonUrl = `${targetBase}${reqPath}`;
         const options = {
             method: req.method,
             headers: {
